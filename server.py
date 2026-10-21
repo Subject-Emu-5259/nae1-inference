@@ -97,9 +97,21 @@ def load_model() -> None:
         model = Nae1ForCausalLM.from_pretrained(
             str(src), torch_dtype=torch.bfloat16)
         model.eval()
+        # The checkpoint stores no lm_head tensor (embeddings are tied).
+        # Some transformers versions materialize weights in a way that
+        # breaks the __init__ alias and never re-tie, leaving lm_head
+        # uninitialized — generation then degenerates to a single token
+        # (observed in production: endless <|pad|>). Re-tie explicitly in
+        # plain PyTorch so the load is correct on any framework version.
+        if getattr(model.config, "tie_word_embeddings", False):
+            model.lm_head.weight = model.model.embed_tokens.weight
         TOK, MODEL = tok, model
         STATE["ready"] = True
-        print(f"[ready] {MODEL_LABEL} loaded from {src}", flush=True)
+        with torch.no_grad():
+            probe = generate("The capital of France is", 6, 0.0, 1.0,
+                             stop_on_call=False)
+        print(f"[ready] {MODEL_LABEL} loaded from {src} | probe: {probe!r}",
+              flush=True)
     except Exception as exc:  # keep /health answering so the failure is visible
         STATE["error"] = f"{type(exc).__name__}: {exc}"
         print(f"[fatal] model load failed: {STATE['error']}", flush=True)
