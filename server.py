@@ -279,6 +279,16 @@ def _bearer(handler) -> str:
     return auth[7:] if auth.startswith("Bearer ") else ""
 
 
+def _chat_auth_ok(handler) -> bool:
+    """The public site's worker attaches the token as X-Nae1-Auth (its
+    long-standing proxy convention); direct API clients use Bearer."""
+    if not CHAT_TOKEN:
+        return False
+    if hmac.compare_digest(_bearer(handler), CHAT_TOKEN):
+        return True
+    return hmac.compare_digest(handler.headers.get("X-Nae1-Auth", ""), CHAT_TOKEN)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -316,10 +326,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path not in ("/chat", "/generate"):
+        if self.path not in ("/chat", "/generate", "/abort"):
             return self._json(404, {"error": "not found"})
-        if not CHAT_TOKEN or not hmac.compare_digest(_bearer(self), CHAT_TOKEN):
+        if not _chat_auth_ok(self):
             return self._json(401, {"error": "unauthorized"})
+        if self.path == "/abort":
+            # API parity with the site worker: generations are short and
+            # synchronous here, so there is never one in flight to stop.
+            return self._json(200, {"ok": True, "aborted": 0})
         if not STATE["ready"]:
             return self._json(503, {"error": "model not ready", "detail": STATE["error"]})
         try:
