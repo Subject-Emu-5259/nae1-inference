@@ -203,37 +203,54 @@ def exec_tool(name: str, arg: str) -> str:
 
 
 # ---------------------------------------------------------------- generation
+class ClientGone(Exception):
+    """The streaming client disconnected; abort generation and free the lock."""
+
+
+def _pick(logits: torch.Tensor, out: list[int], temperature: float,
+          top_p: float, rep_penalty: float) -> int:
+    if rep_penalty and rep_penalty != 1.0 and out:
+        seen = torch.tensor(sorted(set(out)), dtype=torch.long)
+        s = logits[seen]
+        logits[seen] = torch.where(s < 0, s * rep_penalty, s / rep_penalty)
+    if temperature and temperature > 0:
+        probs = torch.softmax(logits / temperature, dim=-1)
+        vals, idx = torch.sort(probs, descending=True)
+        cume = torch.cumsum(vals, dim=0)
+        keep = cume - vals < top_p
+        keep[0] = True
+        return int(idx[torch.multinomial(vals * keep, 1)].item())
+    return int(torch.argmax(logits).item())
+
+
 @torch.no_grad()
 def generate(prompt: str, max_new: int, temperature: float, top_p: float,
              stop_on_call: bool, rep_penalty: float = 1.0,
              on_token=None) -> str:
+    """KV-cached generation. The naive full-forward-per-token version took
+    >10s/token on the free-tier CPU share; with the cache each step is a
+    single-token forward. Sampling math is unchanged (verified token-for-
+    token against the uncached path)."""
     ids = TOK.encode(prompt).ids[-(N_CTX - CTX_RESERVE):]
     x = torch.tensor([ids], dtype=torch.long)
     out: list[int] = []
+    res = MODEL(input_ids=x, use_cache=True)
+    logits = res["logits"][0, -1].float()
+    past = res["past_key_values"]
     for _ in range(max_new):
-        logits = MODEL(input_ids=x)["logits"][0, -1].float()
-        if rep_penalty and rep_penalty != 1.0 and out:
-            seen = torch.tensor(sorted(set(out)), dtype=torch.long)
-            s = logits[seen]
-            logits[seen] = torch.where(s < 0, s * rep_penalty, s / rep_penalty)
-        if temperature and temperature > 0:
-            probs = torch.softmax(logits / temperature, dim=-1)
-            vals, idx = torch.sort(probs, descending=True)
-            cume = torch.cumsum(vals, dim=0)
-            keep = cume - vals < top_p
-            keep[0] = True
-            nxt = int(idx[torch.multinomial(vals * keep, 1)].item())
-        else:
-            nxt = int(torch.argmax(logits).item())
+        nxt = _pick(logits, out, temperature, top_p, rep_penalty)
         if nxt == EOS_ID:
             break
         out.append(nxt)
-        x = torch.cat([x, torch.tensor([[nxt]])], dim=1)
         if on_token:
             on_token(TOK.decode(out))
         if stop_on_call and len(out) % 4 == 0:
             if find_complete_call(TOK.decode(out), eof=False):
                 break
+        res = MODEL(input_ids=torch.tensor([[nxt]]), past_key_values=past,
+                    use_cache=True)
+        logits = res["logits"][0, -1].float()
+        past = res["past_key_values"]
     return TOK.decode(out)
 
 
@@ -307,6 +324,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # quiet
         pass
 
+    def setup(self):
+        super().setup()
+        # No handler may wedge a connection forever (a stalled socket once
+        # held the generation lock hostage through a dead stream).
+        self.connection.settimeout(180)
+
     def _json(self, code: int, obj: dict):
         body = json.dumps(obj).encode()
         self.send_response(code)
@@ -376,6 +399,7 @@ class Handler(BaseHTTPRequestHandler):
         SSE-style stream of `data: {"text": <cumulative visible text>,
         "done": bool}` lines, ending with done=true + eos=true. The prompt
         is wrapped as a single user turn in the shipped chat template."""
+        self.connection.settimeout(30)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -390,22 +414,28 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self.wfile.write(("data: " + json.dumps(obj) + "\n").encode())
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            except OSError:
                 state["dead"] = True
 
         def emit(text):
+            if state["dead"]:
+                raise ClientGone()
             state["last"] = text
             frame({"text": text, "done": False})
+            if state["dead"]:
+                raise ClientGone()
 
         try:
             self.wfile.write(b": neuralai stream open\n")
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             return
         try:
             out = chat([{"role": "user", "content": str(req.get("prompt", ""))}],
                        max_new, temperature, top_p, rep_penalty=rep, emit=emit)
             frame({"text": out["reply"], "done": True, "eos": True})
+        except ClientGone:
+            return
         except Exception as exc:
             print(f"[site-stream] error: {exc}", flush=True)
             frame({"text": state["last"], "done": True, "eos": False})
