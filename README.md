@@ -19,8 +19,8 @@ response and `serving/tool_protocol.py` in the NeuralAI repo.
 | Endpoint | Auth | Notes |
 | --- | --- | --- |
 | `GET /health` | public | Render health check; model facts JSON |
-| `POST /chat` | `Authorization: Bearer $CHAT_TOKEN` | `{messages:[{role,content}], max_tokens?, temperature?, top_p?}` → `{reply, tool_calls}`. Runs the trained tool loop (max 3 rounds) |
-| `POST /generate` | Bearer `$CHAT_TOKEN` | `{prompt, ...}` → `{text}` raw completion |
+| `POST /chat` | `Authorization: Bearer $CHAT_TOKEN` | Two shapes. API: `{messages:[{role,content}], max_tokens?, temperature?, top_p?}` → `{reply, tool_calls}`. Site protocol (public chat page): `{prompt, temperature, top_k, top_p, max_new_tokens, repetition_penalty}` → SSE-style stream of `data: {"text": <cumulative>, "done": bool}` lines ending `done: true, eos: true`. Both run the trained tool loop (max 3 rounds) |
+| `POST /generate` | Bearer `$CHAT_TOKEN` | `{prompt, max_tokens?|max_new_tokens?, repetition_penalty?}` → `{text}` raw completion |
 | `GET /diag` | Bearer `$DIAG_KEY` | readiness, uptime, model source |
 
 ## Tool loop

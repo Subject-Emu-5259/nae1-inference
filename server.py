@@ -193,12 +193,17 @@ def exec_tool(name: str, arg: str) -> str:
 # ---------------------------------------------------------------- generation
 @torch.no_grad()
 def generate(prompt: str, max_new: int, temperature: float, top_p: float,
-             stop_on_call: bool) -> str:
+             stop_on_call: bool, rep_penalty: float = 1.0,
+             on_token=None) -> str:
     ids = TOK.encode(prompt).ids[-(N_CTX - CTX_RESERVE):]
     x = torch.tensor([ids], dtype=torch.long)
     out: list[int] = []
     for _ in range(max_new):
         logits = MODEL(input_ids=x)["logits"][0, -1].float()
+        if rep_penalty and rep_penalty != 1.0 and out:
+            seen = torch.tensor(sorted(set(out)), dtype=torch.long)
+            s = logits[seen]
+            logits[seen] = torch.where(s < 0, s * rep_penalty, s / rep_penalty)
         if temperature and temperature > 0:
             probs = torch.softmax(logits / temperature, dim=-1)
             vals, idx = torch.sort(probs, descending=True)
@@ -212,6 +217,8 @@ def generate(prompt: str, max_new: int, temperature: float, top_p: float,
             break
         out.append(nxt)
         x = torch.cat([x, torch.tensor([[nxt]])], dim=1)
+        if on_token:
+            on_token(TOK.decode(out))
         if stop_on_call and len(out) % 4 == 0:
             if find_complete_call(TOK.decode(out), eof=False):
                 break
@@ -230,15 +237,21 @@ def visible_text(model_text: str) -> str:
 
 
 def chat(messages: list[dict], max_new: int, temperature: float,
-         top_p: float) -> dict:
+         top_p: float, rep_penalty: float = 1.0, emit=None) -> dict:
     prompt = render_prompt(messages)
     transcript = prompt
     calls = []
     reply = ""
+    prior_raw = ""
     for _ in range(MAX_ROUNDS + 1):
+        cb = None
+        if emit:
+            def cb(round_text, _prior=prior_raw):
+                emit(visible_text(_prior + round_text))
         with GEN_LOCK:
             gen = generate(transcript, max_new, temperature, top_p,
-                           stop_on_call=True)
+                           stop_on_call=True, rep_penalty=rep_penalty,
+                           on_token=cb)
         call = find_complete_call(gen, eof=True)
         if not call:
             reply = gen
@@ -251,7 +264,9 @@ def chat(messages: list[dict], max_new: int, temperature: float,
         # fused token 4776 carries — then "\n", the result block, "\n",
         # and the SAME assistant turn continues. No second "NeuralAI:".
         m = _CALL_RE.search(gen)
-        transcript += gen[: m.end()] + "\n" + exec_tool(name, arg) + "\n"
+        block = exec_tool(name, arg)
+        transcript += gen[: m.end()] + "\n" + block + "\n"
+        prior_raw += gen[: m.end()] + "\n" + block + "\n"
         calls.append({"tool": name, "arg": arg})
         reply = gen[: m.end()]
     return {"reply": visible_text(reply), "tool_calls": calls,
@@ -311,19 +326,63 @@ class Handler(BaseHTTPRequestHandler):
             req = self._body()
         except Exception:
             return self._json(400, {"error": "invalid json"})
-        max_new = min(int(req.get("max_tokens", 160)), 512)
+        max_new = min(int(req.get("max_tokens", req.get("max_new_tokens", 160))), 512)
         temperature = float(req.get("temperature", 0.7))
         top_p = float(req.get("top_p", 0.9))
+        rep = float(req.get("repetition_penalty", 1.0))
         if self.path == "/generate":
             with GEN_LOCK:
                 text = generate(str(req.get("prompt", "")), max_new,
-                                temperature, top_p, stop_on_call=False)
+                                temperature, top_p, stop_on_call=False,
+                                rep_penalty=rep)
             return self._json(200, {"text": text})
+        if "prompt" in req and "messages" not in req:
+            return self._site_stream(req, max_new, temperature, top_p, rep)
         messages = req.get("messages")
         if not isinstance(messages, list) or not messages:
             return self._json(400, {"error": "messages required"})
-        out = chat(messages, max_new, temperature, top_p)
+        out = chat(messages, max_new, temperature, top_p, rep_penalty=rep)
         return self._json(200, {"reply": out["reply"], "tool_calls": out["tool_calls"]})
+
+    def _site_stream(self, req, max_new, temperature, top_p, rep):
+        """Site protocol (the public chat page): body {prompt, temperature,
+        top_k, top_p, max_new_tokens, repetition_penalty}; response is an
+        SSE-style stream of `data: {"text": <cumulative visible text>,
+        "done": bool}` lines, ending with done=true + eos=true. The prompt
+        is wrapped as a single user turn in the shipped chat template."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        state = {"last": "", "dead": False}
+
+        def frame(obj):
+            if state["dead"]:
+                return
+            try:
+                self.wfile.write(("data: " + json.dumps(obj) + "\n").encode())
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                state["dead"] = True
+
+        def emit(text):
+            state["last"] = text
+            frame({"text": text, "done": False})
+
+        try:
+            self.wfile.write(b": neuralai stream open\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        try:
+            out = chat([{"role": "user", "content": str(req.get("prompt", ""))}],
+                       max_new, temperature, top_p, rep_penalty=rep, emit=emit)
+            frame({"text": out["reply"], "done": True, "eos": True})
+        except Exception as exc:
+            print(f"[site-stream] error: {exc}", flush=True)
+            frame({"text": state["last"], "done": True, "eos": False})
 
 
 def main():
