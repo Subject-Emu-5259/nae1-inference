@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NeuralAI — Nae1 inference service (rebuilt 2026-10-21 for the SFT v8 release).
 
-Serves the SFT v9 LoRA assistant checkpoint (step-12000, adapters merged)
+Serves the SFT v10 LoRA assistant checkpoint (step-12000, adapters merged)
 natively in PyTorch bf16
 on CPU. Endpoints:
 
@@ -58,11 +58,11 @@ CTX_RESERVE = 256
 MAX_ROUNDS = 3
 MAX_TOOL_TOKENS = 250
 TOOLS = ("search", "fetch", "read_file")
-MODEL_LABEL = "nae1-sft-v9-lora-step12000 (bf16)"
+MODEL_LABEL = "nae1-sft-v10-lora-step12000 (bf16)"
 STEP = 12000
 # 50-doc guardrail set (fluency_docs_20261017), n_ctx 512 — the only PPL
 # measured for this checkpoint; see the model card for the protocol note.
-GUARDRAIL_PPL = 47.96
+GUARDRAIL_PPL = 48.01
 # Device/dtype are env-driven: Render keeps the defaults (cpu, bfloat16);
 # the Modal deployment sets DEVICE=cuda, DTYPE=float32 (T4 has no bf16
 # tensor cores; a 100M model in fp32 is still far faster than needed).
