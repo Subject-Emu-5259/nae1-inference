@@ -6,6 +6,12 @@ swapped to the **SFT v9 LoRA release** the same day. The service
 contract was reconstructed from the original deployment's live /health
 response and `serving/tool_protocol.py` in the NeuralAI repo.
 
+## Live
+
+- **Chat with NEA1:** https://neuralai-nae1.deandrewh26-d6e.workers.dev — the public chat site; this service is its inference backend
+- **NeuralAI — the company:** https://neuralai.wasmer.app
+- **The model:** [GitHub](https://github.com/Subject-Emu-5259/NeuralAI) · [Hugging Face](https://huggingface.co/Subject-Emu-5259/NeuralAI-Nae1)
+
 ## What it serves
 
 - Checkpoint: `sft_v9_lora_step12000_bf16/` from
@@ -44,6 +50,9 @@ MODEL_DIR=/path/to/sft_v9_lora_step12000 CHAT_TOKEN=dev DIAG_KEY=dev python serv
 ```
 
 ## Deploy
+
+Primary serving is Modal (CPU containers, app `neuralai-nae1`; see
+`modal_app.py` in this repo). The Render service below is the fallback.
 
 Render web service, Docker runtime, repo branch `main`, auto-deploy on
 commit. Env vars on the service: `CHAT_TOKEN`, `DIAG_KEY` (secrets, set in
