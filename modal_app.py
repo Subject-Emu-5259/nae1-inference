@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Modal deployment of the NEA1 inference service (T4 GPU).
+"""Modal deployment of the NEA1 inference service (CPU containers).
 
 Runs the SAME server.py as the Render deployment — same endpoints,
-protocol, and auth — on a T4 GPU with the serving checkpoint baked into
-the image. Scale-to-zero: a container starts on request, stays warm for
-the scaledown window, then shuts off, so the Starter plan's monthly
-compute credits only burn while the service is actually up.
+protocol, and auth — with the serving checkpoint baked into the image.
+(GPU/T4 was the first choice but Modal gates GPU functions behind a
+payment method on file; Dre chose the CPU pivot on 2026-10-21 — still
+~13x faster than Render's free tier.) Scale-to-zero: a container starts
+on request, stays warm for the scaledown window, then shuts off, so the
+Starter plan's monthly compute credits only burn while the service is
+actually up.
 
 Deliberately NOT kept warm by the keepalive worker (that worker still
 pings Render, the fallback): a 10-minute ping cadence would hold a GPU
@@ -21,7 +24,7 @@ import modal
 app = modal.App("neuralai-nae1")
 
 HF_REPO = "Subject-Emu-5259/NeuralAI-Nae1"
-HF_SUBDIR = "sft_v9_lora_step12000_bf16"
+HF_SUBDIR = "sft_v10_lora_step12000_bf16"
 MODEL_FILES = ("model.safetensors", "config.json", "tokenizer.json",
                "tokenizer_config.json")
 
