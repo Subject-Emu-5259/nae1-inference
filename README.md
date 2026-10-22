@@ -1,16 +1,17 @@
 # nae1-inference
 
 Inference service for **NeuralAI — Nae1**, rebuilt 2026-10-21 for the
-**SFT v8 assistant release** after the original repo was deleted. The service
+**SFT v8 assistant release** after the original repo was deleted; checkpoint
+swapped to the **SFT v9 LoRA release** the same day. The service
 contract was reconstructed from the original deployment's live /health
 response and `serving/tool_protocol.py` in the NeuralAI repo.
 
 ## What it serves
 
-- Checkpoint: `sft_v8_step16000_bf16/` from
+- Checkpoint: `sft_v9_lora_step12000_bf16/` from
   [Subject-Emu-5259/NeuralAI-Nae1](https://huggingface.co/Subject-Emu-5259/NeuralAI-Nae1)
-  (bf16 serving copy of the gated f32 release; golden-40 32.5/40 PASS,
-  tool calls 36/40, guardrail PPL 59.26 on the 50-doc set)
+  (bf16 serving copy of the gated f32 release; golden-40 33.5/40 PASS,
+  tool calls 39/40, guardrail PPL 47.96 on the 50-doc set)
 - Engine: native PyTorch `Nae1ForCausalLM`, bf16, CPU
 - Downloads the checkpoint from Hugging Face at boot into `model_cache/`
 
@@ -38,7 +39,7 @@ the model can react to).
 ## Run locally
 
 ```bash
-MODEL_DIR=/path/to/sft_v8_step16000 CHAT_TOKEN=dev DIAG_KEY=dev python server.py
+MODEL_DIR=/path/to/sft_v9_lora_step12000 CHAT_TOKEN=dev DIAG_KEY=dev python server.py
 # PORT defaults to 10000
 ```
 

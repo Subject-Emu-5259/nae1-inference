@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """NeuralAI — Nae1 inference service (rebuilt 2026-10-21 for the SFT v8 release).
 
-Serves the SFT v8 assistant checkpoint (step-16000) natively in PyTorch bf16
+Serves the SFT v9 LoRA assistant checkpoint (step-12000, adapters merged)
+natively in PyTorch bf16
 on CPU. Endpoints:
 
   GET  /health    public; deployment health + model facts (shape kept from
@@ -49,7 +50,7 @@ CHAT_TOKEN = os.environ.get("CHAT_TOKEN", "")
 DIAG_KEY = os.environ.get("DIAG_KEY", "")
 MODEL_DIR = os.environ.get("MODEL_DIR", "")  # local override (tests)
 HF_REPO = os.environ.get("HF_REPO", "Subject-Emu-5259/NeuralAI-Nae1")
-HF_SUBDIR = os.environ.get("HF_SUBDIR", "sft_v8_step16000_bf16")
+HF_SUBDIR = os.environ.get("HF_SUBDIR", "sft_v9_lora_step12000_bf16")
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(HERE / "data")))
 EOS_ID = 3
 N_CTX = 2048
@@ -57,11 +58,11 @@ CTX_RESERVE = 256
 MAX_ROUNDS = 3
 MAX_TOOL_TOKENS = 250
 TOOLS = ("search", "fetch", "read_file")
-MODEL_LABEL = "nae1-sft-v8-step16000 (bf16)"
-STEP = 16000
+MODEL_LABEL = "nae1-sft-v9-lora-step12000 (bf16)"
+STEP = 12000
 # 50-doc guardrail set (fluency_docs_20261017), n_ctx 512 — the only PPL
 # measured for this checkpoint; see the model card for the protocol note.
-GUARDRAIL_PPL = 59.26
+GUARDRAIL_PPL = 47.96
 
 STATE = {"ready": False, "error": None, "started": time.time()}
 MODEL = None
