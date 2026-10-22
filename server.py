@@ -63,6 +63,13 @@ STEP = 12000
 # 50-doc guardrail set (fluency_docs_20261017), n_ctx 512 — the only PPL
 # measured for this checkpoint; see the model card for the protocol note.
 GUARDRAIL_PPL = 47.96
+# Device/dtype are env-driven: Render keeps the defaults (cpu, bfloat16);
+# the Modal deployment sets DEVICE=cuda, DTYPE=float32 (T4 has no bf16
+# tensor cores; a 100M model in fp32 is still far faster than needed).
+DEVICE = os.environ.get("DEVICE", "cpu")
+_DTYPE_NAME = os.environ.get("DTYPE", "bfloat16")
+DTYPE = {"bfloat16": torch.bfloat16, "float32": torch.float32,
+         "float16": torch.float16}[_DTYPE_NAME]
 
 STATE = {"ready": False, "error": None, "started": time.time()}
 MODEL = None
@@ -96,7 +103,7 @@ def load_model() -> None:
         cfg = json.loads((src / "tokenizer_config.json").read_text())
         CHAT_TEMPLATE = cfg["chat_template"]
         model = Nae1ForCausalLM.from_pretrained(
-            str(src), torch_dtype=torch.bfloat16)
+            str(src), torch_dtype=DTYPE)
         model.eval()
         # The checkpoint stores no lm_head tensor (embeddings are tied).
         # Some transformers versions materialize weights in a way that
@@ -106,6 +113,7 @@ def load_model() -> None:
         # plain PyTorch so the load is correct on any framework version.
         if getattr(model.config, "tie_word_embeddings", False):
             model.lm_head.weight = model.model.embed_tokens.weight
+        model.to(DEVICE)
         TOK, MODEL = tok, model
         STATE["ready"] = True
         with torch.no_grad():
@@ -211,7 +219,8 @@ class ClientGone(Exception):
 def _pick(logits: torch.Tensor, out: list[int], temperature: float,
           top_p: float, rep_penalty: float) -> int:
     if rep_penalty and rep_penalty != 1.0 and out:
-        seen = torch.tensor(sorted(set(out)), dtype=torch.long)
+        seen = torch.tensor(sorted(set(out)), dtype=torch.long,
+                            device=logits.device)
         s = logits[seen]
         logits[seen] = torch.where(s < 0, s * rep_penalty, s / rep_penalty)
     if temperature and temperature > 0:
@@ -233,7 +242,8 @@ def generate(prompt: str, max_new: int, temperature: float, top_p: float,
     single-token forward. Sampling math is unchanged (verified token-for-
     token against the uncached path)."""
     ids = TOK.encode(prompt).ids[-(N_CTX - CTX_RESERVE):]
-    x = torch.tensor([ids], dtype=torch.long)
+    dev = next(MODEL.parameters()).device
+    x = torch.tensor([ids], dtype=torch.long, device=dev)
     out: list[int] = []
     res = MODEL(input_ids=x, use_cache=True)
     logits = res["logits"][0, -1].float()
@@ -248,8 +258,8 @@ def generate(prompt: str, max_new: int, temperature: float, top_p: float,
         if stop_on_call and len(out) % 4 == 0:
             if find_complete_call(TOK.decode(out), eof=False):
                 break
-        res = MODEL(input_ids=torch.tensor([[nxt]]), past_key_values=past,
-                    use_cache=True)
+        res = MODEL(input_ids=torch.tensor([[nxt]], device=dev),
+                    past_key_values=past, use_cache=True)
         logits = res["logits"][0, -1].float()
         past = res["past_key_values"]
     return TOK.decode(out)
@@ -352,7 +362,8 @@ class Handler(BaseHTTPRequestHandler):
                 "status": "ok", "model": MODEL_LABEL, "model_type": "nae1",
                 "tokenizer_vocab": 32000, "context": N_CTX,
                 "params": 100111872, "step": STEP, "heldout_ppl": GUARDRAIL_PPL,
-                "engine": "torch (native Nae1ForCausalLM, bf16)", "device": "cpu"})
+                "engine": f"torch (native Nae1ForCausalLM, {_DTYPE_NAME})",
+                "device": DEVICE})
         if self.path == "/diag":
             if not DIAG_KEY or not hmac.compare_digest(_bearer(self), DIAG_KEY):
                 return self._json(401, {"error": "unauthorized"})
@@ -386,7 +397,7 @@ class Handler(BaseHTTPRequestHandler):
                                 temperature, top_p, stop_on_call=False,
                                 rep_penalty=rep)
             return self._json(200, {"text": text})
-        if "prompt" in req and "messages" not in req:
+        if "prompt" in req or "messages" in req:
             return self._site_stream(req, max_new, temperature, top_p, rep)
         messages = req.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -396,10 +407,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _site_stream(self, req, max_new, temperature, top_p, rep):
         """Site protocol (the public chat page): body {prompt, temperature,
-        top_k, top_p, max_new_tokens, repetition_penalty}; response is an
-        SSE-style stream of `data: {"text": <cumulative visible text>,
-        "done": bool}` lines, ending with done=true + eos=true. The prompt
-        is wrapped as a single user turn in the shipped chat template."""
+        top_k, top_p, max_new_tokens, repetition_penalty} — or, since the
+        2026-10-21 site rebuild, {messages: [{role, content}, ...]} for a
+        multi-turn conversation, rendered through the same chat template;
+        response is an SSE-style stream of `data: {"text": <cumulative
+        visible text>, "done": bool}` lines, ending with done=true +
+        eos=true."""
         self.connection.settimeout(30)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -432,7 +445,24 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             return
         try:
-            out = chat([{"role": "user", "content": str(req.get("prompt", ""))}],
+            raw_msgs = req.get("messages")
+            if isinstance(raw_msgs, list) and raw_msgs:
+                convo = []
+                for m in raw_msgs[-24:]:
+                    if not isinstance(m, dict):
+                        continue
+                    role = str(m.get("role", "user"))
+                    if role not in ("user", "assistant", "system"):
+                        role = "user"
+                    convo.append({"role": role,
+                                  "content": str(m.get("content", ""))})
+                if not convo:
+                    convo = [{"role": "user",
+                              "content": str(req.get("prompt", ""))}]
+            else:
+                convo = [{"role": "user",
+                          "content": str(req.get("prompt", ""))}]
+            out = chat(convo,
                        max_new, temperature, top_p, rep_penalty=rep, emit=emit)
             frame({"text": out["reply"], "done": True, "eos": True})
         except ClientGone:
@@ -444,7 +474,13 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    threading.Thread(target=load_model, daemon=True).start()
+    if os.environ.get("BLOCKING_LOAD"):
+        # Modal: bind the port only once the model is ready, so the
+        # platform's startup wait covers the full cold start and no
+        # request can land on a not-ready server.
+        load_model()
+    else:
+        threading.Thread(target=load_model, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"[listen] :{PORT}", flush=True)
     server.serve_forever()
