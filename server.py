@@ -217,7 +217,7 @@ class ClientGone(Exception):
 
 
 def _pick(logits: torch.Tensor, out: list[int], temperature: float,
-          top_p: float, rep_penalty: float) -> int:
+          top_p: float, rep_penalty: float, min_p: float = 0.0) -> int:
     if rep_penalty and rep_penalty != 1.0 and out:
         seen = torch.tensor(sorted(set(out)), dtype=torch.long,
                             device=logits.device)
@@ -225,6 +225,12 @@ def _pick(logits: torch.Tensor, out: list[int], temperature: float,
         logits[seen] = torch.where(s < 0, s * rep_penalty, s / rep_penalty)
     if temperature and temperature > 0:
         probs = torch.softmax(logits / temperature, dim=-1)
+        if min_p and min_p > 0:
+            # min-p: drop tokens below min_p x the top token's probability.
+            # Trims the garbage tail that dominates at high temperature on a
+            # small model, without touching the plausible head.
+            probs = torch.where(probs >= min_p * probs.max(), probs,
+                                torch.zeros_like(probs))
         vals, idx = torch.sort(probs, descending=True)
         cume = torch.cumsum(vals, dim=0)
         keep = cume - vals < top_p
@@ -236,7 +242,7 @@ def _pick(logits: torch.Tensor, out: list[int], temperature: float,
 @torch.no_grad()
 def generate(prompt: str, max_new: int, temperature: float, top_p: float,
              stop_on_call: bool, rep_penalty: float = 1.0,
-             on_token=None) -> str:
+             on_token=None, min_p: float = 0.0) -> str:
     """KV-cached generation. The naive full-forward-per-token version took
     >10s/token on the free-tier CPU share; with the cache each step is a
     single-token forward. Sampling math is unchanged (verified token-for-
@@ -249,7 +255,7 @@ def generate(prompt: str, max_new: int, temperature: float, top_p: float,
     logits = res["logits"][0, -1].float()
     past = res["past_key_values"]
     for _ in range(max_new):
-        nxt = _pick(logits, out, temperature, top_p, rep_penalty)
+        nxt = _pick(logits, out, temperature, top_p, rep_penalty, min_p)
         if nxt == EOS_ID:
             break
         out.append(nxt)
@@ -277,7 +283,8 @@ def visible_text(model_text: str) -> str:
 
 
 def chat(messages: list[dict], max_new: int, temperature: float,
-         top_p: float, rep_penalty: float = 1.0, emit=None) -> dict:
+         top_p: float, rep_penalty: float = 1.0, emit=None,
+         min_p: float = 0.0) -> dict:
     prompt = render_prompt(messages)
     transcript = prompt
     calls = []
@@ -291,7 +298,7 @@ def chat(messages: list[dict], max_new: int, temperature: float,
         with GEN_LOCK:
             gen = generate(transcript, max_new, temperature, top_p,
                            stop_on_call=True, rep_penalty=rep_penalty,
-                           on_token=cb)
+                           on_token=cb, min_p=min_p)
         call = find_complete_call(gen, eof=True)
         if not call:
             reply = gen
@@ -391,21 +398,22 @@ class Handler(BaseHTTPRequestHandler):
         temperature = float(req.get("temperature", 0.7))
         top_p = float(req.get("top_p", 0.9))
         rep = float(req.get("repetition_penalty", 1.0))
+        min_p = min(max(float(req.get("min_p", 0.0)), 0.0), 0.5)
         if self.path == "/generate":
             with GEN_LOCK:
                 text = generate(str(req.get("prompt", "")), max_new,
                                 temperature, top_p, stop_on_call=False,
-                                rep_penalty=rep)
+                                rep_penalty=rep, min_p=min_p)
             return self._json(200, {"text": text})
         if "prompt" in req or "messages" in req:
-            return self._site_stream(req, max_new, temperature, top_p, rep)
+            return self._site_stream(req, max_new, temperature, top_p, rep, min_p)
         messages = req.get("messages")
         if not isinstance(messages, list) or not messages:
             return self._json(400, {"error": "messages required"})
-        out = chat(messages, max_new, temperature, top_p, rep_penalty=rep)
+        out = chat(messages, max_new, temperature, top_p, rep_penalty=rep, min_p=min_p)
         return self._json(200, {"reply": out["reply"], "tool_calls": out["tool_calls"]})
 
-    def _site_stream(self, req, max_new, temperature, top_p, rep):
+    def _site_stream(self, req, max_new, temperature, top_p, rep, min_p=0.0):
         """Site protocol (the public chat page): body {prompt, temperature,
         top_k, top_p, max_new_tokens, repetition_penalty} — or, since the
         2026-10-21 site rebuild, {messages: [{role, content}, ...]} for a
@@ -463,7 +471,8 @@ class Handler(BaseHTTPRequestHandler):
                 convo = [{"role": "user",
                           "content": str(req.get("prompt", ""))}]
             out = chat(convo,
-                       max_new, temperature, top_p, rep_penalty=rep, emit=emit)
+                       max_new, temperature, top_p, rep_penalty=rep, emit=emit,
+                       min_p=min_p)
             frame({"text": out["reply"], "done": True, "eos": True})
         except ClientGone:
             return
