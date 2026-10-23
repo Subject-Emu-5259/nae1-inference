@@ -24,7 +24,7 @@ import modal
 app = modal.App("neuralai-nae1")
 
 HF_REPO = "Subject-Emu-5259/NeuralAI-Nae1"
-HF_SUBDIR = "sft_v12_2_lora_step12000_bf16"
+HF_SUBDIR = "sft_v13_2_lora_step12000_bf16"
 MODEL_FILES = ("model.safetensors", "config.json", "tokenizer.json",
                "tokenizer_config.json")
 
