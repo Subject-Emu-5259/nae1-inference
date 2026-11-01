@@ -8,7 +8,7 @@ on CPU. Endpoints:
   GET  /health    public; deployment health + model facts (shape kept from
                   the original service)
   POST /chat      Bearer CHAT_TOKEN; {messages:[{role,content}], ...}
-                  runs the trained tool loop (search/fetch/read_file)
+                  runs the trained tool loop (search/fetch/read_file/calc)
   POST /generate  Bearer CHAT_TOKEN; {prompt, ...} raw completion
   GET  /diag      Bearer DIAG_KEY; runtime diagnostics
 
@@ -24,6 +24,7 @@ NeuralAI repo, which survived the original service.
 """
 from __future__ import annotations
 
+import ast
 import hmac
 import ipaddress
 import json
@@ -57,7 +58,7 @@ N_CTX = 2048
 CTX_RESERVE = 256
 MAX_ROUNDS = 3
 MAX_TOOL_TOKENS = 250
-TOOLS = ("search", "fetch", "read_file")
+TOOLS = ("search", "fetch", "read_file", "calc")
 MODEL_LABEL = "nae1-sft-v13-2-lora-step12000 (bf16)"
 STEP = 12000
 # 50-doc guardrail set (fluency_docs_20261017), n_ctx 512 — the only PPL
@@ -176,7 +177,123 @@ def _public_url(url: str) -> bool:
         return False
 
 
+def _calc_eval(expr: str):
+    """Safe arithmetic only: numbers and + - * / % ** ( ). No names,
+    calls, or attribute access, so an expression can never run code."""
+    if len(expr) > 200:
+        raise ValueError("expression too long")
+    tree = ast.parse(expr, mode="eval")
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(
+                    node.value, (int, float)):
+                raise ValueError("not a number")
+            return node.value
+        if isinstance(node, ast.BinOp):
+            left = ev(node.left)
+            right = ev(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+            if isinstance(node.op, ast.Pow):
+                if abs(right) > 100 or abs(left) > 1000000:
+                    raise ValueError("power too large")
+                return left ** right
+            raise ValueError("operator not allowed")
+        if isinstance(node, ast.UnaryOp):
+            value = ev(node.operand)
+            if isinstance(node.op, ast.UAdd):
+                return +value
+            if isinstance(node.op, ast.USub):
+                return -value
+            raise ValueError("operator not allowed")
+        raise ValueError("not arithmetic")
+
+    return ev(tree)
+
+
+def _calc_format(value) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, float):
+        return f"{value:.10g}"
+    return str(value)
+
+
+# ------------------------------------------------------- deterministic calc
+# STAGED 2026-10-30 (Dre's go: "confirm build it" — deterministic calc
+# layer, NOT YET DEPLOYED; deploy only with Dre's separate deploy go).
+# Why: five SFT builds (v13.3–v13.7) never got the model to copy digits
+# reliably (best 29/40, stubborn no-calls + attractor drifts). The
+# calculator itself was never wrong — only the model's copying was. So
+# direct arithmetic questions bypass model generation entirely: the
+# server extracts the expression from the question, evaluates it with
+# the same safe evaluator the calc tool uses, and answers
+# deterministically. The model path is untouched for everything else
+# (open-ended chat, multi-step reasoning, non-direct questions), and
+# any detection/evaluation failure falls through to the model path —
+# fail-open, never fail-wrong.
+_DIRECT_ARITH_RE = re.compile(
+    r"^\s*(?:what\s+is|what's|calculate|work\s+out|compute)\s+"
+    r"([\d\s\.\+\-\*/%\(\)]+?)\s*\??\s*$", re.IGNORECASE)
+_EXPR_CHARS_RE = re.compile(r"^[\d\s\.\+\-\*/%\(\)]+$")
+
+
+def detect_direct_arithmetic(text: str):
+    """Return the arithmetic expression if `text` is a single direct
+    arithmetic question, else None. Strict by design: the whole message
+    must be one opener + one pure expression — no prose, no second
+    clause, no words inside the expression. Anything else -> None and
+    the caller uses the model path."""
+    if not isinstance(text, str):
+        return None
+    m = _DIRECT_ARITH_RE.match(text.strip())
+    if not m:
+        return None
+    expr = re.sub(r"\s+", " ", m.group(1)).strip()
+    # A trailing sentence period is punctuation, not part of the number
+    # ("Calculate 1000 / 8." -> "1000 / 8"). A decimal point inside the
+    # expression is untouched (only one trailing dot is stripped).
+    if expr.endswith("."):
+        expr = expr[:-1].rstrip()
+    if not expr or not _EXPR_CHARS_RE.match(expr):
+        return None
+    if expr.count("(") != expr.count(")"):
+        return None
+    # A bare number is not a question ("What is 42?" -> no operator).
+    if not re.search(r"[\+\-\*/%]", expr):
+        return None
+    return expr
+
+
 def exec_tool(name: str, arg: str) -> str:
+    if name == "calc":
+        # STAGED 2026-10-30 (v13.6 format fix, NOT YET DEPLOYED — deploy
+        # only with Dre's promotion go): v13.6 call lines carry a leading
+        # space inside the quotes (» calc(" 126 + 359")) so call tokens
+        # match question tokens exactly. ast.parse rejects leading
+        # whitespace, so evaluate the stripped query; the block still
+        # echoes the original arg so inference context matches training
+        # traces byte-for-byte. Stripping is a no-op for all old-format
+        # queries, so this changes nothing for the currently serving model.
+        try:
+            value = _calc_eval(arg.strip())
+        except ZeroDivisionError:
+            return error_block(name, arg, "math_error", "division by zero")
+        except Exception:
+            return error_block(name, arg, "invalid_expression",
+                               "only numbers and + - * / % ** ( ) are allowed")
+        return tool_block(name, arg, _calc_format(value))
     if name == "search":
         return error_block(name, arg, "search_unavailable",
                            "no search backend is configured on this deployment")
@@ -285,6 +402,22 @@ def visible_text(model_text: str) -> str:
 def chat(messages: list[dict], max_new: int, temperature: float,
          top_p: float, rep_penalty: float = 1.0, emit=None,
          min_p: float = 0.0) -> dict:
+    # Deterministic calc layer (staged 2026-10-30): a direct arithmetic
+    # question as the last user message is answered without generation.
+    # Any detection or evaluation failure falls through to the model.
+    if messages and messages[-1].get("role") == "user":
+        expr = detect_direct_arithmetic(messages[-1].get("content", ""))
+        if expr is not None:
+            try:
+                reply = "The answer is " + _calc_format(_calc_eval(expr)) + "."
+            except Exception:
+                reply = None
+            if reply is not None:
+                prompt = render_prompt(messages)
+                return {"reply": reply,
+                        "tool_calls": [{"tool": "calc", "arg": expr,
+                                        "deterministic": True}],
+                        "transcript": prompt + reply}
     prompt = render_prompt(messages)
     transcript = prompt
     calls = []
