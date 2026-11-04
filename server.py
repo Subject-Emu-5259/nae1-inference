@@ -11,6 +11,13 @@ on CPU. Endpoints:
                   runs the trained tool loop (search/fetch/read_file/calc)
   POST /generate  Bearer CHAT_TOKEN; {prompt, ...} raw completion
   GET  /diag      Bearer DIAG_KEY; runtime diagnostics
+  GET  /v1/models
+  GET  /v1/models/<id>
+  POST /v1/chat/completions
+                  Bearer CHAT_TOKEN (or X-Nae1-Auth); OpenAI-compatible,
+                  non-streaming. Browser-safe: answers CORS preflights and
+                  sends Access-Control-Allow-Origin on every /v1 response,
+                  so a web page (e.g. OpenStudio) can call it directly.
 
 The chat prompt is rendered with the checkpoint's own shipped chat template
 (tokenizer_config.json) — a single source of truth. Its generation prompt
@@ -34,6 +41,7 @@ import socket
 import threading
 import time
 import urllib.request
+from urllib.parse import unquote, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -60,6 +68,9 @@ MAX_ROUNDS = 3
 MAX_TOOL_TOKENS = 250
 TOOLS = ("search", "fetch", "read_file", "calc")
 MODEL_LABEL = "nae1-sft-v13-2-lora-step12000 (bf16)"
+# Clean, typable id for the OpenAI-compatible API (the label above carries
+# spaces and parens, which clients would have to URL-encode everywhere).
+API_MODEL_ID = "nea1-v13.2"
 STEP = 12000
 # 50-doc guardrail set (fluency_docs_20261017), n_ctx 512 — the only PPL
 # measured for this checkpoint; see the model card for the protocol note.
@@ -481,13 +492,28 @@ class Handler(BaseHTTPRequestHandler):
         # held the generation lock hostage through a dead stream).
         self.connection.settimeout(180)
 
-    def _json(self, code: int, obj: dict):
+    def _json(self, code: int, obj: dict, cors: bool = False):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if cors:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "authorization, content-type, x-nae1-auth")
         self.end_headers()
         self.wfile.write(body)
+
+    def _v1_model_object(self) -> dict:
+        return {"id": API_MODEL_ID, "object": "model",
+                "created": int(STATE["started"]), "owned_by": "neuralai"}
+
+    def _v1_error(self, code: int, message: str, err_code: str):
+        return self._json(code, {"error": {
+            "message": message, "type": "invalid_request_error",
+            "code": err_code}}, cors=True)
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length", "0"))
@@ -510,28 +536,66 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ready": STATE["ready"], "error": STATE["error"],
                                     "uptime_s": round(time.time() - STATE["started"]),
                                     "model": MODEL_LABEL, "hf_source": f"{HF_REPO}/{HF_SUBDIR}"})
+        v1path = urlsplit(self.path).path
+        if v1path == "/v1/models":
+            if not _chat_auth_ok(self):
+                return self._json(401, {"error": "unauthorized"}, cors=True)
+            return self._json(200, {"object": "list",
+                                    "data": [self._v1_model_object()]}, cors=True)
+        if v1path.startswith("/v1/models/"):
+            if not _chat_auth_ok(self):
+                return self._json(401, {"error": "unauthorized"}, cors=True)
+            wanted = unquote(v1path[len("/v1/models/"):])
+            if wanted in (API_MODEL_ID, MODEL_LABEL):
+                return self._json(200, self._v1_model_object(), cors=True)
+            return self._v1_error(404, f"model not found: {wanted}",
+                                  "model_not_found")
+        return self._json(404, {"error": "not found"},
+                          cors=v1path.startswith("/v1/"))
+
+    def do_OPTIONS(self):
+        # Browser preflight for the /v1 API (a web page calling the model
+        # directly). Other paths keep the default 501 behavior untouched.
+        if urlsplit(self.path).path.startswith("/v1/"):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "authorization, content-type, x-nae1-auth")
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         return self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path not in ("/chat", "/generate", "/abort"):
-            return self._json(404, {"error": "not found"})
+        v1path = urlsplit(self.path).path
+        is_v1 = v1path == "/v1/chat/completions"
+        if self.path not in ("/chat", "/generate", "/abort") and not is_v1:
+            return self._json(404, {"error": "not found"},
+                              cors=v1path.startswith("/v1/"))
         if not _chat_auth_ok(self):
-            return self._json(401, {"error": "unauthorized"})
+            return self._json(401, {"error": "unauthorized"}, cors=is_v1)
         if self.path == "/abort":
             # API parity with the site worker: generations are short and
             # synchronous here, so there is never one in flight to stop.
             return self._json(200, {"ok": True, "aborted": 0})
         if not STATE["ready"]:
-            return self._json(503, {"error": "model not ready", "detail": STATE["error"]})
+            return self._json(503, {"error": "model not ready",
+                                    "detail": STATE["error"]}, cors=is_v1)
         try:
             req = self._body()
         except Exception:
-            return self._json(400, {"error": "invalid json"})
+            return self._json(400, {"error": "invalid json"}, cors=is_v1)
         max_new = min(int(req.get("max_tokens", req.get("max_new_tokens", 160))), 512)
         temperature = float(req.get("temperature", 0.7))
         top_p = float(req.get("top_p", 0.9))
         rep = float(req.get("repetition_penalty", 1.0))
         min_p = min(max(float(req.get("min_p", 0.0)), 0.0), 0.5)
+        if is_v1:
+            return self._v1_chat_completions(req, max_new, temperature,
+                                             top_p, rep, min_p)
         if self.path == "/generate":
             with GEN_LOCK:
                 text = generate(str(req.get("prompt", "")), max_new,
@@ -545,6 +609,58 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "messages required"})
         out = chat(messages, max_new, temperature, top_p, rep_penalty=rep, min_p=min_p)
         return self._json(200, {"reply": out["reply"], "tool_calls": out["tool_calls"]})
+
+    def _v1_chat_completions(self, req, max_new, temperature, top_p, rep, min_p):
+        """OpenAI-compatible, non-streaming chat completion.
+
+        Request: {model?, messages: [{role, content}], temperature?,
+        top_p?, max_tokens?, repetition_penalty?, min_p?}. Unknown fields
+        (e.g. response_format) are ignored. The served model is fixed, so
+        a model name that is not ours is a 404, not a silent substitution.
+        """
+        if req.get("stream"):
+            return self._v1_error(400, "streaming is not supported by this endpoint",
+                                  "invalid_request_error")
+        wanted = req.get("model")
+        if wanted is not None and str(wanted) not in (API_MODEL_ID, MODEL_LABEL):
+            return self._v1_error(404, f"model not found: {wanted}",
+                                  "model_not_found")
+        raw_msgs = req.get("messages")
+        if not isinstance(raw_msgs, list) or not raw_msgs:
+            return self._v1_error(400, "messages required",
+                                  "invalid_request_error")
+        convo = []
+        for m in raw_msgs[-24:]:
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role", "user"))
+            if role not in ("user", "assistant", "system"):
+                role = "user"
+            convo.append({"role": role, "content": str(m.get("content", ""))})
+        if not convo:
+            return self._v1_error(400, "messages required",
+                                  "invalid_request_error")
+        try:
+            out = chat(convo, max_new, temperature, top_p,
+                       rep_penalty=rep, min_p=min_p)
+        except Exception as exc:
+            return self._v1_error(500, f"generation failed: {exc}",
+                                  "internal_error")
+        reply = out["reply"]
+        prompt_tokens = count_tokens(render_prompt(convo))
+        completion_tokens = count_tokens(reply)
+        return self._json(200, {
+            "id": "chatcmpl-nea1-" + format(int(time.time()), "x"),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": API_MODEL_ID,
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": reply},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": prompt_tokens,
+                      "completion_tokens": completion_tokens,
+                      "total_tokens": prompt_tokens + completion_tokens},
+        }, cors=True)
 
     def _site_stream(self, req, max_new, temperature, top_p, rep, min_p=0.0):
         """Site protocol (the public chat page): body {prompt, temperature,
