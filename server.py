@@ -287,7 +287,13 @@ def detect_direct_arithmetic(text: str):
     return expr
 
 
-def exec_tool(name: str, arg: str) -> str:
+def exec_tool(name: str, arg: str):
+    """Execute one tool call. Returns (block, outcome) where block is the
+    byte-true result block for the model transcript (unchanged by this
+    function — the transcript assembly must match training traces
+    exactly) and outcome is a small display dict for the tool-call UI:
+    {"ok": bool, "status": short outcome string, "detail": error
+    message or None}. Outcome text is never fed to the model."""
     if name == "calc":
         # STAGED 2026-10-30 (v13.6 format fix, NOT YET DEPLOYED — deploy
         # only with Dre's promotion go): v13.6 call lines carry a leading
@@ -300,43 +306,64 @@ def exec_tool(name: str, arg: str) -> str:
         try:
             value = _calc_eval(arg.strip())
         except ZeroDivisionError:
-            return error_block(name, arg, "math_error", "division by zero")
+            return error_block(name, arg, "math_error", "division by zero"), \
+                {"ok": False, "status": "math_error",
+                 "detail": "division by zero"}
         except Exception:
             return error_block(name, arg, "invalid_expression",
-                               "only numbers and + - * / % ** ( ) are allowed")
-        return tool_block(name, arg, _calc_format(value))
+                               "only numbers and + - * / % ** ( ) are allowed"), \
+                {"ok": False, "status": "invalid_expression",
+                 "detail": "only numbers and + - * / % ** ( ) are allowed"}
+        return tool_block(name, arg, _calc_format(value)), \
+            {"ok": True, "status": "ok", "detail": None}
     if name == "search":
         return error_block(name, arg, "search_unavailable",
-                           "no search backend is configured on this deployment")
+                           "no search backend is configured on this deployment"), \
+            {"ok": False, "status": "unavailable",
+             "detail": "no search backend is configured on this deployment"}
     if name == "fetch":
         if not arg.startswith(("https://", "http://")) or not _public_url(arg):
             return error_block(name, arg, "blocked_url",
-                               "only public http(s) URLs can be fetched")
+                               "only public http(s) URLs can be fetched"), \
+                {"ok": False, "status": "blocked_url",
+                 "detail": "only public http(s) URLs can be fetched"}
         try:
             req = urllib.request.Request(arg, headers={"User-Agent": "NeuralAI-Nae1/1.0"})
             with urllib.request.urlopen(req, timeout=8) as resp:
+                status = resp.status
                 raw = resp.read(65536).decode("utf-8", "replace")
             text = re.sub(r"<script.*?</script>|<style.*?</style>", " ",
                           raw, flags=re.S)
             text = re.sub(r"<[^>]+>", " ", text)
             text = re.sub(r"\s+", " ", text).strip()
-            return tool_block(name, arg, truncate_to_budget(text))
+            return tool_block(name, arg, truncate_to_budget(text)), \
+                {"ok": True, "status": f"{status} OK", "detail": None}
         except Exception as exc:
-            return error_block(name, arg, "fetch_failed", str(exc)[:160])
+            return error_block(name, arg, "fetch_failed", str(exc)[:160]), \
+                {"ok": False, "status": "fetch_failed",
+                 "detail": str(exc)[:160]}
     if name == "read_file":
         try:
             path = (DATA_DIR / arg).resolve()
             if DATA_DIR.resolve() not in path.parents and path != DATA_DIR.resolve():
                 return error_block(name, arg, "blocked_path",
-                                   "files are limited to the data directory")
+                                   "files are limited to the data directory"), \
+                    {"ok": False, "status": "blocked_path",
+                     "detail": "files are limited to the data directory"}
             if not path.is_file():
                 return error_block(name, arg, "not_found",
-                                   "no such file in the data directory")
+                                   "no such file in the data directory"), \
+                    {"ok": False, "status": "not_found",
+                     "detail": "no such file in the data directory"}
             return tool_block(name, arg,
-                              truncate_to_budget(path.read_text("utf-8", "replace")))
+                              truncate_to_budget(path.read_text("utf-8", "replace"))), \
+                {"ok": True, "status": "ok", "detail": None}
         except Exception as exc:
-            return error_block(name, arg, "read_failed", str(exc)[:160])
-    return error_block(name, arg, "unknown_tool", name)
+            return error_block(name, arg, "read_failed", str(exc)[:160]), \
+                {"ok": False, "status": "read_failed",
+                 "detail": str(exc)[:160]}
+    return error_block(name, arg, "unknown_tool", name), \
+        {"ok": False, "status": "unknown_tool", "detail": name}
 
 
 # ---------------------------------------------------------------- generation
@@ -412,7 +439,12 @@ def visible_text(model_text: str) -> str:
 
 def chat(messages: list[dict], max_new: int, temperature: float,
          top_p: float, rep_penalty: float = 1.0, emit=None,
-         min_p: float = 0.0) -> dict:
+         min_p: float = 0.0, on_tool=None) -> dict:
+    # on_tool, when given, is called with one display event per tool
+    # fire ({"tool", "arg", "ok", "status", "detail"?}) as the tool
+    # executes. The event is a display-only channel: it never enters
+    # the transcript and never changes what the model sees. The
+    # transcript assembly below is byte-true to the training traces.
     # Deterministic calc layer (staged 2026-10-30): a direct arithmetic
     # question as the last user message is answered without generation.
     # Any detection or evaluation failure falls through to the model.
@@ -455,10 +487,16 @@ def chat(messages: list[dict], max_new: int, temperature: float,
         # fused token 4776 carries — then "\n", the result block, "\n",
         # and the SAME assistant turn continues. No second "NeuralAI:".
         m = _CALL_RE.search(gen)
-        block = exec_tool(name, arg)
+        block, outcome = exec_tool(name, arg)
         transcript += gen[: m.end()] + "\n" + block + "\n"
         prior_raw += gen[: m.end()] + "\n" + block + "\n"
-        calls.append({"tool": name, "arg": arg})
+        ev = {"tool": name, "arg": arg, "ok": outcome["ok"],
+              "status": outcome["status"]}
+        if outcome.get("detail"):
+            ev["detail"] = outcome["detail"]
+        calls.append(ev)
+        if on_tool:
+            on_tool(ev)
         reply = gen[: m.end()]
     return {"reply": visible_text(reply), "tool_calls": calls,
             "transcript": transcript}
@@ -696,6 +734,12 @@ class Handler(BaseHTTPRequestHandler):
             if state["dead"]:
                 raise ClientGone()
 
+        def on_tool(ev):
+            # Display-only tool event: one frame per tool fire, carrying
+            # the tool name, arg, and outcome. The page renders it as a
+            # collapsible details block. Never enters model context.
+            frame({"tool": ev})
+
         try:
             self.wfile.write(b": neuralai stream open\n")
             self.wfile.flush()
@@ -721,8 +765,12 @@ class Handler(BaseHTTPRequestHandler):
                           "content": str(req.get("prompt", ""))}]
             out = chat(convo,
                        max_new, temperature, top_p, rep_penalty=rep, emit=emit,
-                       min_p=min_p)
-            frame({"text": out["reply"], "done": True, "eos": True})
+                       on_tool=on_tool, min_p=min_p)
+            # tool_calls (with outcomes) rides the final frame so the page
+            # can render details blocks even if a mid-stream tool frame
+            # was dropped; the page skips entries it already rendered.
+            frame({"text": out["reply"], "done": True, "eos": True,
+                   "tool_calls": out["tool_calls"]})
         except ClientGone:
             return
         except Exception as exc:
