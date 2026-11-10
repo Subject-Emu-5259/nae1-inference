@@ -649,16 +649,17 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"reply": out["reply"], "tool_calls": out["tool_calls"]})
 
     def _v1_chat_completions(self, req, max_new, temperature, top_p, rep, min_p):
-        """OpenAI-compatible, non-streaming chat completion.
+        """OpenAI-compatible chat completion.
 
         Request: {model?, messages: [{role, content}], temperature?,
-        top_p?, max_tokens?, repetition_penalty?, min_p?}. Unknown fields
-        (e.g. response_format) are ignored. The served model is fixed, so
-        a model name that is not ours is a 404, not a silent substitution.
+        top_p?, max_tokens?, repetition_penalty?, min_p?, stream?}.
+        Unknown fields (e.g. response_format) are ignored. The served
+        model is fixed, so a model name that is not ours is a 404, not
+        a silent substitution. stream=true returns OpenAI-style SSE
+        chunks (see _v1_stream); the reply is generated in full first,
+        exactly as the non-streaming path does, then emitted as delta
+        chunks — there is no token-incremental generation loop here.
         """
-        if req.get("stream"):
-            return self._v1_error(400, "streaming is not supported by this endpoint",
-                                  "invalid_request_error")
         wanted = req.get("model")
         if wanted is not None and str(wanted) not in (API_MODEL_ID, MODEL_LABEL):
             return self._v1_error(404, f"model not found: {wanted}",
@@ -684,6 +685,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._v1_error(500, f"generation failed: {exc}",
                                   "internal_error")
+        if req.get("stream"):
+            return self._v1_stream(out["reply"], out["tool_calls"])
         reply = out["reply"]
         prompt_tokens = count_tokens(render_prompt(convo))
         completion_tokens = count_tokens(reply)
@@ -699,6 +702,60 @@ class Handler(BaseHTTPRequestHandler):
                       "completion_tokens": completion_tokens,
                       "total_tokens": prompt_tokens + completion_tokens},
         }, cors=True)
+
+    def _v1_stream(self, reply, tool_calls):
+        """OpenAI-compatible SSE stream for /v1/chat/completions.
+
+        Emits: a role chunk, the reply in a few word-boundary chunks
+        (not one byte at a time, not one giant frame), a final chunk
+        with delta {} and finish_reason "stop", then `data: [DONE]`.
+        tool_calls ride the final chunk when the reply fired tools —
+        same events the /chat path returns. A client that disconnects
+        mid-stream just ends the write; nothing else is affected.
+        """
+        cid = "chatcmpl-nea1-" + format(int(time.time()), "x")
+        created = int(time.time())
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.close_connection = True
+
+        def frame(obj):
+            try:
+                self.wfile.write(("data: " + json.dumps(obj) + "\n").encode())
+                self.wfile.flush()
+            except OSError:
+                raise ClientGone()
+
+        def chunk(delta, finish_reason):
+            return {"id": cid, "object": "chat.completion.chunk",
+                    "created": created, "model": API_MODEL_ID,
+                    "choices": [{"index": 0, "delta": delta,
+                                 "finish_reason": finish_reason}]}
+
+        try:
+            frame(chunk({"role": "assistant", "content": ""}, None))
+            buf = ""
+            for word in str(reply).split(" "):
+                piece = word if not buf else " " + word
+                if buf and len(buf) + len(piece) > 48:
+                    frame(chunk({"content": buf}, None))
+                    buf = word
+                else:
+                    buf += piece
+            if buf:
+                frame(chunk({"content": buf}, None))
+            final = chunk({}, "stop")
+            if tool_calls:
+                final["choices"][0]["tool_calls"] = tool_calls
+            frame(final)
+            self.wfile.write(b"data: [DONE]\n")
+            self.wfile.flush()
+        except (OSError, ClientGone):
+            return
 
     def _site_stream(self, req, max_new, temperature, top_p, rep, min_p=0.0):
         """Site protocol (the public chat page): body {prompt, temperature,
