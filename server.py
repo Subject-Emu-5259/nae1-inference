@@ -32,6 +32,7 @@ NeuralAI repo, which survived the original service.
 from __future__ import annotations
 
 import ast
+import datetime
 import hmac
 import ipaddress
 import json
@@ -287,6 +288,215 @@ def detect_direct_arithmetic(text: str):
     return expr
 
 
+# ------------------------------------------------------- deterministic date
+# EXTENDED 2026-11-11 (Dre's go: "Extend the §8 date layer") — the same
+# pattern as the §8 calc layer above: direct date questions bypass model
+# generation entirely. v17 + three SFT patches all NO-GO'd on the date
+# rollover, and v3 proved SFT teaches the format of a derivation, not
+# the derivation (the model writes "+2" and computes +1; the year
+# increment never generalizes). Python's datetime does the arithmetic;
+# the layer only formats the answer. Fail-open: any detection or
+# parsing failure falls through to the model path.
+# "Today" is resolved bracket-first: the Workspace Mac app sends a
+# system line "Today is Wednesday, November 11, 2026. ..." built from
+# Dre's clock, and that always wins when present — it is the date the
+# user sees. The public site chat sends no date at all (the Worker is
+# a pure proxy), so the fallback is the server's local date, forced to
+# America/Chicago below so every leg (Mac, VM, Modal, Render) agrees
+# even though the VM/Modal/Render hosts run UTC. time.time() callers
+# (uptime, completion ids) are TZ-independent, so forcing TZ here
+# changes nothing else in this process.
+try:
+    os.environ.setdefault("TZ", "America/Chicago")
+    time.tzset()
+except Exception:
+    pass
+
+_MONTHS = {name: i for i, name in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july",
+     "august", "september", "october", "november", "december"], start=1)}
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday",
+             "saturday", "sunday")
+_DATE_RE = re.compile(
+    r"(?:(monday|tuesday|wednesday|thursday|friday|saturday|sunday),\s*)?"
+    r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+"
+    r"(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})", re.IGNORECASE)
+_TODAY_LINE_RE = re.compile(r"today\s+is\s+", re.IGNORECASE)
+_BRACKET_DATE_RE = re.compile(r"\[([^\]]+)\]")
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "twenty one": 21, "twenty two": 22, "twenty three": 23,
+    "twenty four": 24, "twenty five": 25, "twenty six": 26,
+    "twenty seven": 27, "twenty eight": 28, "twenty nine": 29,
+    "thirty": 30, "thirty one": 31,
+}
+_ONES = ["", "one", "two", "three", "four", "five", "six", "seven",
+         "eight", "nine", "ten", "eleven", "twelve", "thirteen",
+         "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+         "nineteen"]
+_TENS = ["", "", "twenty", "thirty"]
+
+
+def _num_to_word(n: int) -> str:
+    if n < 20:
+        return _ONES[n]
+    tens, ones = divmod(n, 10)
+    return _TENS[tens] + ("-" + _ONES[ones] if ones else "")
+
+
+def _parse_date(text: str):
+    """Parse 'Wednesday, November 11, 2026' (weekday optional) -> a
+    datetime.date, else None. A present weekday that disagrees with
+    the calendar rejects the line — never trust a wrong bracket."""
+    if not isinstance(text, str):
+        return None
+    m = _DATE_RE.search(text)
+    if not m:
+        return None
+    weekday, month, day, year = m.groups()
+    try:
+        d = datetime.date(int(year), _MONTHS[month.lower()], int(day))
+    except ValueError:
+        return None
+    if weekday and d.strftime("%A").lower() != weekday.lower():
+        return None
+    return d
+
+
+def _today_from_messages(messages):
+    """'Today' from a caller-supplied date. Only system messages count,
+    and only a 'Today is <date>' line or a '[<date>]' bracket — a user
+    message mentioning a date ('my birthday is March 5, 2020') must
+    never be read as today. The FIRST (newest) system message carrying
+    a date decides: if it parses, use it; if it doesn't, fall back to
+    the server's local date rather than trusting an older, staler one.
+    Returns a datetime.date or None."""
+    for m in reversed(messages or []):
+        if not isinstance(m, dict) or m.get("role") != "system":
+            continue
+        content = m.get("content", "")
+        if not isinstance(content, str) or not content:
+            continue
+        tm = _TODAY_LINE_RE.search(content)
+        if tm:
+            d = _parse_date(content[tm.end():])
+            return d  # None when unparseable: fall back, don't scan older
+        for b in _BRACKET_DATE_RE.findall(content):
+            d = _parse_date(b)
+            if d is not None:
+                return d
+        # A system message with no date: keep scanning older ones.
+    return None
+
+
+def _fmt_date(d) -> str:
+    return "%s, %s %d, %d" % (d.strftime("%A"), d.strftime("%B"),
+                              d.day, d.year)
+
+
+def _parse_num(token: str):
+    """'two' / 'twenty one' / '14' -> int 1..31, else None."""
+    token = (token or "").strip().lower()
+    if token.isdigit():
+        n = int(token)
+        return n if 1 <= n <= 31 else None
+    return _NUMBER_WORDS.get(token)
+
+
+_NUM_ALT = (r"\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|"
+            r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+            r"eighteen|nineteen|twenty(?: one| two| three| four| five| six|"
+            r" seven| eight| nine)?|thirty(?: one)?")
+
+
+def detect_direct_date(text: str, messages=None):
+    """Return the one-sentence answer if `text` is a single direct date
+    question, else None. Strict by design, mirroring the §8 calc
+    detector: the whole message must be one question — no prose, no
+    second clause. Anything ambiguous, multi-clause, or unparseable ->
+    None and the caller uses the model path. A bare date with no
+    question ('What is August 31, 2025?') is not a date question."""
+    if not isinstance(text, str):
+        return None
+    # Normalize like the Workspace detectors: collapse whitespace,
+    # lowercase, strip apostrophes, hyphens -> spaces ("twenty-one"
+    # and "twenty one" behave the same).
+    t = " ".join(text.split()).strip().lower().replace("'", "")
+    t = t.replace("-", " ")
+    if not t:
+        return None
+
+    today = _today_from_messages(messages)
+    if today is None:
+        today = datetime.date.today()
+
+    # Weekday of an explicit date: "what day of the week is
+    # September 1, 2025?" / "what day is November 11, 2026?"
+    m = re.match(r"^what (?:day of the week|day|weekday) (?:is|was) (.+?)\s*[?.!]*$",
+                 t)
+    if m:
+        d = _parse_date(m.group(1))
+        if d is not None:
+            return "%s %d, %d is a %s." % (d.strftime("%B"), d.day,
+                                           d.year, d.strftime("%A"))
+        # No parseable date ("what day is it?") — fall through to the
+        # today/tomorrow checks below, never return None here.
+
+    # "in N days": "what date is it in two days?" / "what day will it
+    # be in two days?" / "what will the date be in 5 days?"
+    m = re.match(r"^what (?:day|date)(?: is it| will it be)? in (" + _NUM_ALT +
+                 r") days?\s*[?.!]*$", t)
+    if not m:
+        m = re.match(r"^what will the date be in (" + _NUM_ALT +
+                     r") days?\s*[?.!]*$", t)
+    if m:
+        n = _parse_num(m.group(1))
+        if n is None:
+            return None
+        return "In %s day%s it will be %s." % (
+            _num_to_word(n), "" if n == 1 else "s",
+            _fmt_date(today + datetime.timedelta(days=n)))
+
+    # "N days ago": "what date was it two days ago?"
+    m = re.match(r"^what (?:day|date)(?: was it| was)? (" + _NUM_ALT +
+                 r") days? ago\s*[?.!]*$", t)
+    if not m:
+        m = re.match(r"^what was the date (" + _NUM_ALT +
+                     r") days? ago\s*[?.!]*$", t)
+    if m:
+        n = _parse_num(m.group(1))
+        if n is None:
+            return None
+        return "%s day%s ago it was %s." % (
+            _num_to_word(n).capitalize(), "" if n == 1 else "s",
+            _fmt_date(today - datetime.timedelta(days=n)))
+
+    # Tomorrow: "what date is tomorrow?" / "whats tomorrows date?"
+    if re.match(r"^what(?:s| is)?(?: the)? (?:day|date)(?: is)? tomorrow\s*[?.!]*$",
+                t) or re.match(r"^what(?:s| is)? tomorrows date\s*[?.!]*$", t) \
+            or re.match(r"^what day is tomorrow\s*[?.!]*$", t):
+        return "Tomorrow is %s." % _fmt_date(today + datetime.timedelta(days=1))
+
+    # Yesterday: "what date is yesterday?" / "what was yesterdays date?"
+    if re.match(r"^what(?:s| is| was)?(?: the)? (?:day|date)(?: is| was)? yesterday\s*[?.!]*$",
+                t) or re.match(r"^what(?:s| is| was)? yesterdays date\s*[?.!]*$", t) \
+            or re.match(r"^what day was yesterday\s*[?.!]*$", t):
+        return "Yesterday was %s." % _fmt_date(today - datetime.timedelta(days=1))
+
+    # Today: "what day is it?" / "what is the date?" / "whats todays date?"
+    # ("what date is it today?" carries both "is it" AND "today".)
+    if re.match(r"^what(?:s| is)?(?: the)? (?:day|date)(?: is it)?(?: today)?\s*[?.!]*$",
+                t) or re.match(r"^what(?:s| is)? todays date\s*[?.!]*$", t) \
+            or re.match(r"^todays date\s*[?.!]*$", t) \
+            or re.match(r"^what day is (?:it|today)\s*[?.!]*$", t):
+        return "Today is %s." % _fmt_date(today)
+
+    return None
+
+
 def exec_tool(name: str, arg: str):
     """Execute one tool call. Returns (block, outcome) where block is the
     byte-true result block for the model transcript (unchanged by this
@@ -461,6 +671,20 @@ def chat(messages: list[dict], max_new: int, temperature: float,
                         "tool_calls": [{"tool": "calc", "arg": expr,
                                         "deterministic": True}],
                         "transcript": prompt + reply}
+    # Deterministic date layer (extended 2026-11-11): a direct date
+    # question as the last user message is answered without generation.
+    # Disjoint from the arithmetic patterns above; any detection or
+    # parsing failure falls through to the model.
+    if messages and messages[-1].get("role") == "user":
+        date_reply = detect_direct_date(messages[-1].get("content", ""),
+                                        messages)
+        if date_reply is not None:
+            prompt = render_prompt(messages)
+            return {"reply": date_reply,
+                    "tool_calls": [{"tool": "date",
+                                    "arg": messages[-1].get("content", "").strip(),
+                                    "deterministic": True}],
+                    "transcript": prompt + date_reply}
     prompt = render_prompt(messages)
     transcript = prompt
     calls = []
