@@ -84,6 +84,28 @@ MAX_FETCH_TOKENS = 500  # SVC-P2-11: fetch gets a bigger window than the
 # it. The model is offered only fetch + calc.
 TOOLS = ("fetch", "calc")
 MODEL_LABEL = "nae1-sft-v17-lora-step9250 (bf16)"
+# OBS-1 (2026-11-12): serving observability — every chat reply says which
+# node answered and which model served, so a swap can be verified from the
+# VM without Dre's Mac. The node name comes from env NEA1_NODE_NAME (set
+# by the VM launcher) or a NODE_NAME file in the app dir (the Mac swap
+# package ships one); Render sets neither, so it reports no node — correct,
+# Render is not a Fabric node. Resolved once at import; a missing name
+# means "no node field", never a guess.
+def _resolve_node_name():
+    name = os.environ.get("NEA1_NODE_NAME", "").strip()
+    if name:
+        return name
+    try:
+        f = HERE / "NODE_NAME"
+        if f.is_file():
+            name = f.read_text().strip()
+            if name:
+                return name
+    except OSError:
+        pass
+    return None
+
+NODE_NAME = _resolve_node_name()
 # Clean, typable id for the OpenAI-compatible API (the label above carries
 # spaces and parens, which clients would have to URL-encode everywhere).
 API_MODEL_ID = "nea1-v13.2"
@@ -1397,6 +1419,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except OSError:
             return
+        # OBS-1: node tag first — the site UI ignores frames without
+        # `text` (both parsers guard `frame.text != null`), so this is
+        # a no-op there; curl/probes read it directly.
+        if NODE_NAME:
+            frame({"node": NODE_NAME})
         try:
             raw_msgs = req.get("messages")
             if isinstance(raw_msgs, list) and raw_msgs:
@@ -1422,14 +1449,24 @@ class Handler(BaseHTTPRequestHandler):
             # can render details blocks even if a mid-stream tool frame
             # was dropped; the page skips entries it already rendered.
             # "truncated" (SVC-P2-14) flags a silently shortened history.
-            frame({"text": out["reply"], "done": True, "eos": True,
-                   "tool_calls": out["tool_calls"],
-                   "truncated": out.get("truncated", False)})
+            # OBS-1: the done frame names the model (always) and the node
+            # (Fabric nodes only) — verification reads this, not a probe.
+            done_frame = {"text": out["reply"], "done": True, "eos": True,
+                          "model": MODEL_LABEL,
+                          "tool_calls": out["tool_calls"],
+                          "truncated": out.get("truncated", False)}
+            if NODE_NAME:
+                done_frame["node"] = NODE_NAME
+            frame(done_frame)
         except ClientGone:
             return
         except Exception as exc:
             _log(f"[site-stream] error: {exc}")
-            frame({"text": state["last"], "done": True, "eos": False})
+            err_frame = {"text": state["last"], "done": True, "eos": False,
+                         "model": MODEL_LABEL}
+            if NODE_NAME:
+                err_frame["node"] = NODE_NAME
+            frame(err_frame)
 
 
 def main():
