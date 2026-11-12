@@ -891,11 +891,14 @@ _GRD_NO_FETCH_REPLY = ("I didn't actually fetch a page in this turn, so I "
 
 # Page-attribution verbs + fetch claims. Bare "it says" is deliberately
 # excluded — "it" is ambiguous and would false-positive on ordinary
-# answers; the known failures all name the page explicitly.
+# answers; the known failures all name the page explicitly. Past-tense
+# forms included (caught live 2026-11-12: "The page said it all the
+# time" slipped past a present-tense-only pattern).
 _PAGE_CLAIM_RE = re.compile(
     r"(?:the\s+page|the\s+site|the\s+article|the\s+webpage)\s+"
-    r"(?:says|states|mentions|describes|claims|shows|notes|explains|"
-    r"is\s+about)\b|according\s+to\s+the\s+page\b",
+    r"(?:says|said|states|stated|mentions|mentioned|describes|described|"
+    r"claims|claimed|shows|showed|notes|noted|explains|explained|"
+    r"is\s+about|was\s+about)\b|according\s+to\s+the\s+page\b",
     re.IGNORECASE)
 _PAGE_FETCH_RE = re.compile(
     r"\b(?:I\s+fetched|I\s+checked\s+the\s+page|I\s+looked\s+at\s+the\s+page|"
