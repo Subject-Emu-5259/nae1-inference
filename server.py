@@ -13,7 +13,12 @@ on CPU. Endpoints:
                   2026-11-12: no search backend exists and the data
                   directory is empty, so both tools could only fail;
                   their exec_tool handlers remain for the gate harness,
-                  which calls them directly)
+                  which calls them directly). The GRD-1 grounding guard
+                  (2026-11-12) checks fetch-grounded replies
+                  deterministically: garbled/empty fetches short-circuit
+                  to an honest reply, ungrounded page claims are
+                  corrected from the page text, invented page results
+                  with no fetch are refused.
   POST /generate  Bearer CHAT_TOKEN; {prompt, ...} raw completion
   GET  /diag      Bearer DIAG_KEY; runtime diagnostics
   GET  /v1/models
@@ -793,9 +798,16 @@ def exec_tool(name: str, arg: str):
                           raw, flags=re.S)
             text = re.sub(r"<[^>]+>", " ", text)
             text = re.sub(r"\s+", " ", text).strip()
-            return tool_block(name, arg,
-                              truncate_to_budget(text, MAX_FETCH_TOKENS)), \
-                {"ok": True, "status": f"{status} OK", "detail": None}
+            body = truncate_to_budget(text, MAX_FETCH_TOKENS)
+            # GRD-1: the grounding guard needs the same text the model
+            # sees (the truncated block body). "fetched_text" rides the
+            # outcome dict — display-only, never fed to the model and
+            # never copied into the UI event (chat() copies only
+            # tool/arg/ok/status/detail), so it leaks nowhere. The gate
+            # harness unpacks (block, outcome) and ignores extra keys.
+            return tool_block(name, arg, body), \
+                {"ok": True, "status": f"{status} OK", "detail": None,
+                 "fetched_text": body}
         except Exception as exc:
             # SVC-P2-9: the raw exception (local paths, resolver errors)
             # used to go into the model-facing block AND the UI detail.
@@ -838,6 +850,178 @@ def exec_tool(name: str, arg: str):
                  "detail": "the file could not be read"}
     return error_block(name, arg, "unknown_tool", name), \
         {"ok": False, "status": "unknown_tool", "detail": name}
+
+
+# ------------------------------------------------------- grounding guard
+# GRD-1 (2026-11-12, Dre's go): deterministic serving-layer guard for
+# fetch grounding — the same pattern as the §8 calc/date layers: answer
+# deterministically in the cases the model demonstrably gets wrong, and
+# fail open to the model's own reply on any ambiguity or guard error.
+# The gate JSONs that motivated it (livetools6_v17_9250_trnfix,
+# livetools_multiround_v17_9250):
+#   - fetch_clean_grounded FAIL: clean page fetched, answer was a
+#     degenerate "the page is about the page" loop, nothing from the page.
+#   - fetch_garbled_honest FAIL: garbled page, model invented content.
+#   - multi_second_call FAIL: turn 2 answered with turn 1's Moon fact.
+#   - multi_implicit_then_call FAIL: no fetch at all, model invented
+#     "The page says fetch is blocked."
+# Three cases, all deterministic, no model calls, no new deps:
+#   1. Garbled/empty fetch -> honest short-circuit BEFORE generation
+#      (the server knows the fetch result before the model answers).
+#   2. Clean fetch + ungrounded page-attributed claim -> grounded
+#      correction quoting the relevant page passage.
+#   3. No successful fetch + invented page-result claim -> honest
+#      correction ("I didn't actually fetch a page").
+# Cross-turn confusion is handled by scoping: the guard only ever sees
+# THIS turn's fetch texts, so a turn-1 fact cannot ground a turn-2 claim
+# unless turn 2 fetched the same page. No history rebuild was needed.
+# Buffering: once a fetch fires in a turn, the answer round is not
+# streamed (the complete reply is checked first). Non-fetch turns stream
+# exactly as before, except that emission stops the moment a page claim
+# appears with no fetch behind it (case 3 pre-check).
+
+_GRD_EMPTY_REPLY = ("The page came back empty — there's nothing on it "
+                    "for me to read, so I can't answer from it.")
+_GRD_GARBLED_REPLY = ("I couldn't read that page — the content came back "
+                      "garbled, so I can't answer from it. Try a different "
+                      "URL, or paste the text you want me to work with.")
+_GRD_NO_FETCH_REPLY = ("I didn't actually fetch a page in this turn, so I "
+                       "can't tell you what it says. Give me a URL and "
+                       "I'll fetch it and answer from it.")
+
+# Page-attribution verbs + fetch claims. Bare "it says" is deliberately
+# excluded — "it" is ambiguous and would false-positive on ordinary
+# answers; the known failures all name the page explicitly.
+_PAGE_CLAIM_RE = re.compile(
+    r"(?:the\s+page|the\s+site|the\s+article|the\s+webpage)\s+"
+    r"(?:says|states|mentions|describes|claims|shows|notes|explains|"
+    r"is\s+about)\b|according\s+to\s+the\s+page\b",
+    re.IGNORECASE)
+_PAGE_FETCH_RE = re.compile(
+    r"\b(?:I\s+fetched|I\s+checked\s+the\s+page|I\s+looked\s+at\s+the\s+page|"
+    r"I\s+read\s+the\s+page|I\s+visited\s+the\s+page)\b",
+    re.IGNORECASE)
+# Scaffolding stripped from a claim's head before its content words are
+# read ("The page says the page is about the Moon" -> "the Moon").
+_GRD_SCAFFOLD_RE = re.compile(
+    r"^(?:the\s+page|it)\s+is\s+about\s+", re.IGNORECASE)
+
+_GRD_STOPWORDS = frozenset("""
+a an and are as at be been but by do does did for from has have had he her
+his i in is it its of on or that the their they this to was were with you
+your we our she him them my me us not no so very just more most other some
+any all each can could will would should about page site article webpage
+says said say states mentions describes claims shows notes explains
+""".split())
+
+
+def _fetch_quality(text: str) -> str:
+    """Fetched page text -> "ok" | "empty" | "garbled".
+
+    Rule: empty after strip -> "empty". U+FFFD replacement chars over
+    5% of the text -> "garbled" (binary decoded with errors='replace'
+    measures ~40%; real text pages sit at 0% in any language). Under
+    85% printable chars -> "garbled" (control-char heavy). Checked
+    against the same truncated text the model sees."""
+    if not text or not text.strip():
+        return "empty"
+    n = len(text)
+    if text.count("\ufffd") / n > 0.05:
+        return "garbled"
+    printable = sum(1 for c in text if c.isprintable() or c.isspace())
+    return "garbled" if printable / n < 0.85 else "ok"
+
+
+def _has_page_claim(text: str) -> bool:
+    """True when the reply attributes content to a page or claims a
+    fetch happened. A negated claim ("The page doesn't say that",
+    "I couldn't fetch the page") does not match — the negation breaks
+    the phrase, so honest denials pass through untouched."""
+    return bool(_PAGE_CLAIM_RE.search(text) or _PAGE_FETCH_RE.search(text))
+
+
+def _extract_page_claims(reply: str) -> list[str]:
+    """The attributed clauses of a reply: for each page attribution,
+    the text after it up to the next sentence boundary (max 300 chars).
+    "According to the page, X" yields X; "The page says the page is
+    about the Moon" yields "the Moon" after scaffolding is stripped.
+    A match inside a clause already extracted is not a second claim
+    ("The page says the page is about X" matches both "says" and the
+    inner "is about" — only the outer one counts)."""
+    claims = []
+    consumed_until = 0
+    for m in _PAGE_CLAIM_RE.finditer(reply):
+        if m.start() < consumed_until:
+            continue
+        window = reply[m.end():m.end() + 300]
+        rest = window.lstrip(" ,:")
+        lead = len(window) - len(rest)
+        end = re.search(r"[.!?](\s|$)", rest)
+        clause = rest[:end.start()] if end else rest
+        clause = _GRD_SCAFFOLD_RE.sub("", clause.strip()).strip()
+        claims.append(clause)
+        consumed_until = m.end() + lead + (end.start() if end else len(rest))
+    return claims
+
+
+def _content_words(text: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower())
+            if w not in _GRD_STOPWORDS and len(w) > 1]
+
+
+def _claim_grounded(claim: str, page_text: str) -> bool:
+    """True when at least half of the claim's (deduped) content words
+    appear in the page text (singular/plural-insensitive). A claim with
+    no content words at all is vacuous — "the page is about the page"
+    attributes nothing checkable — and counts as UNGROUNDED, not as a
+    pass: the degenerate loop is the failure this guard was built for."""
+    words = set(_content_words(claim))
+    if not words:
+        return False
+    page_words = set(re.findall(r"[a-z0-9]+", page_text.lower()))
+    hits = sum(1 for w in words
+               if w in page_words
+               or w.rstrip("s") in page_words
+               or (w + "s") in page_words)
+    return hits / len(words) >= 0.5
+
+
+def _best_passage(page_text: str, question: str) -> str:
+    """The page sentence that best matches the user's question (by
+    content-word overlap); falls back to the first sentence when
+    nothing overlaps. Capped at ~300 chars."""
+    sentences = [s.strip() for s in
+                 re.split(r"(?<=[.!?])\s+", page_text) if s.strip()]
+    if not sentences:
+        return page_text[:300].strip() or "(no readable text)"
+    qwords = set(_content_words(question))
+    best, best_score = sentences[0], -1
+    for s in sentences:
+        score = len(qwords & set(_content_words(s)))
+        if score > best_score:
+            best, best_score = s, score
+    if len(best) > 300:
+        best = best[:297].rsplit(" ", 1)[0] + " […]"
+    return best
+
+
+def _guard_reply(reply: str, fetched_texts: list[str],
+                 question: str) -> str:
+    """GRD-1 cases 2 + 3, applied to the complete reply. fetched_texts
+    holds ONLY this turn's successful fetch texts (cross-turn scoping).
+    Returns the reply unchanged unless a page-attributed claim fails
+    its check. Pure function — unit-tested in test_grounding_guard.py."""
+    if fetched_texts:
+        page_text = " ".join(fetched_texts)
+        for claim in _extract_page_claims(reply):
+            if not _claim_grounded(claim, page_text):
+                passage = _best_passage(page_text, question)
+                return ("The page doesn't say that. Here's what it "
+                        f"actually says: \"{passage}\"")
+        return reply
+    if _has_page_claim(reply):
+        return _GRD_NO_FETCH_REPLY
+    return reply
 
 
 # ---------------------------------------------------------------- generation
@@ -969,11 +1153,27 @@ def chat(messages: list[dict], max_new: int, temperature: float,
     calls = []
     reply = ""
     prior_raw = ""
+    # GRD-1 guard state: this turn's successful fetch texts only (the
+    # cross-turn scoping — a turn-1 fact can never ground a turn-2
+    # claim) and whether a fetch has fired (drives emit suppression).
+    guard = {"fetched": False, "fetched_texts": []}
     for _ in range(MAX_ROUNDS + 1):
         cb = None
         if emit:
             def cb(round_text, _prior=prior_raw):
-                emit(visible_text(_prior + round_text))
+                # GRD-1 buffering: once a fetch has fired this turn the
+                # answer round is not streamed — the guard checks the
+                # complete reply first (the done frame still carries the
+                # full text, so the client waits, it never stalls).
+                # With no fetch yet, emission stops the moment a page
+                # claim appears — a claim with no fetch behind it is
+                # case 3, and there is no point streaming it.
+                if guard["fetched"]:
+                    return
+                visible = visible_text(_prior + round_text)
+                if _has_page_claim(visible):
+                    return
+                emit(visible)
         with GEN_LOCK:
             gen = generate(transcript, max_new, temperature, top_p,
                            stop_on_call=True, rep_penalty=rep_penalty,
@@ -1000,6 +1200,22 @@ def chat(messages: list[dict], max_new: int, temperature: float,
         calls.append(ev)
         if on_tool:
             on_tool(ev)
+        if name == "fetch" and outcome.get("ok"):
+            guard["fetched"] = True
+            fetched_text = outcome.get("fetched_text") or ""
+            guard["fetched_texts"].append(fetched_text)
+            # GRD-1 case 1: the fetch came back garbled or empty. The
+            # server knows before the model generates — short-circuit
+            # to an honest reply instead of letting the model invent
+            # page content (the fetch_garbled_honest failure). The tool
+            # event above already fired, so the UI shows the fetch.
+            quality = _fetch_quality(fetched_text)
+            if quality != "ok":
+                _log(f"[guard] case1 {quality} fetch {arg}")
+                reply = (_GRD_EMPTY_REPLY if quality == "empty"
+                         else _GRD_GARBLED_REPLY)
+                return {"reply": reply, "tool_calls": calls,
+                        "transcript": transcript, "truncated": truncated}
         reply = gen[: m.end()]
     if find_complete_call(reply, eof=True):
         # SVC-P2-12: tool-loop exhaustion — every round ended in a call
@@ -1007,7 +1223,21 @@ def chat(messages: list[dict], max_new: int, temperature: float,
         # raw call syntax to the user as the reply.
         reply = ("I couldn't complete that request — the tool calls "
                  "didn't lead to an answer. Please try rephrasing.")
-    return {"reply": visible_text(reply), "tool_calls": calls,
+    # GRD-1 cases 2 + 3: check the complete reply against this turn's
+    # fetch results. Fail-open — any guard error leaves the reply
+    # exactly as the model wrote it.
+    reply_text = visible_text(reply)
+    try:
+        last_user = (messages[-1].get("content", "")
+                     if messages and messages[-1].get("role") == "user"
+                     else "")
+        checked = _guard_reply(reply_text, guard["fetched_texts"], last_user)
+        if checked != reply_text:
+            _log("[guard] case2/3 reply replaced")
+            reply_text = checked
+    except Exception as exc:
+        _log(f"[guard] fail-open: {type(exc).__name__}: {exc}")
+    return {"reply": reply_text, "tool_calls": calls,
             "transcript": transcript, "truncated": truncated}
 
 
@@ -1340,9 +1570,16 @@ class Handler(BaseHTTPRequestHandler):
                        rep_penalty=rep, emit=emit, min_p=min_p)
             reply = out["reply"]
             if reply and not state["sent"].endswith(reply):
-                # No emit covered this reply (deterministic hook, or a
-                # tool-loop-exhaustion message) — send it whole.
-                send_text(reply)
+                # No emit covered this reply (deterministic hook, a
+                # tool-loop-exhaustion message, or a GRD-1-suppressed
+                # fetch turn) — send it whole. If the reply starts with
+                # what already streamed (a prefix emitted before the
+                # guard's suppression kicked in), send only the tail so
+                # the prefix is not duplicated in the stream.
+                if state["sent"] and reply.startswith(state["sent"]):
+                    send_text(reply[len(state["sent"]):])
+                else:
+                    send_text(reply)
                 state["sent"] += reply
             final = chunk({"tool_calls": out["tool_calls"]}
                           if out["tool_calls"] else {}, "stop")
