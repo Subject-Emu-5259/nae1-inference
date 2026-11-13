@@ -209,12 +209,16 @@ def load_model() -> None:
         model = Nae1ForCausalLM.from_pretrained(
             str(src), torch_dtype=DTYPE)
         model.eval()
-        # The checkpoint stores no lm_head tensor (embeddings are tied).
-        # Some transformers versions materialize weights in a way that
-        # breaks the __init__ alias and never re-tie, leaving lm_head
-        # uninitialized — generation then degenerates to a single token
-        # (observed in production: endless <|pad|>). Re-tie explicitly in
-        # plain PyTorch so the load is correct on any framework version.
+        # The checkpoint's embeddings are tied. v13.2's save stores no
+        # lm_head tensor; v17's save materialized one as a byte-identical
+        # duplicate of embed_tokens (GAP3, 2026-11-12 — the HF sidebar
+        # size mismatch). Either way the explicit re-tie below is what
+        # makes the load correct: some transformers versions materialize
+        # weights in a way that breaks the __init__ alias and never
+        # re-tie, leaving lm_head uninitialized — generation then
+        # degenerates to a single token (observed in production: endless
+        # <|pad|>). Re-tie explicitly in plain PyTorch so the load is
+        # correct on any framework version.
         if getattr(model.config, "tie_word_embeddings", False):
             model.lm_head.weight = model.model.embed_tokens.weight
         model.to(DEVICE)
