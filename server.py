@@ -1089,8 +1089,32 @@ def generate(prompt: str, max_new: int, temperature: float, top_p: float,
 
 def render_prompt(messages: list[dict]) -> str:
     import jinja2
-    return jinja2.Template(CHAT_TEMPLATE).render(
-        messages=messages, add_generation_prompt=True)
+    # CMP-1 (2026-11-12): the checkpoint template has NO system role —
+    # every non-user message renders as "NeuralAI: ...", so a system
+    # message (companion persona, news/date grounding, MCP tools)
+    # reached the model as ITS OWN prior speech and it echoed, looped,
+    # and hallucinated from it (Companions bug, Dre 2026-11-12). The
+    # template itself is NOT changed (no HF config re-upload) — the
+    # server is the single chokepoint for all callers (Workspace, API,
+    # site). Extract all system messages and prepend them as a bare
+    # preamble (no role label) before the rendered conversation, so
+    # system content NEVER renders as NeuralAI: speech again. With no
+    # system messages the render is byte-identical to before (the
+    # conversation list passes through untouched).
+    system_parts = []
+    convo = []
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "system":
+            content = str(m.get("content") or "")
+            if content:
+                system_parts.append(content)
+        else:
+            convo.append(m)
+    rendered = jinja2.Template(CHAT_TEMPLATE).render(
+        messages=convo, add_generation_prompt=True)
+    if not system_parts:
+        return rendered
+    return "\n\n".join(system_parts) + "\n\n" + rendered
 
 
 def visible_text(model_text: str) -> str:
