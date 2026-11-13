@@ -1323,9 +1323,36 @@ def render_prompt(messages: list[dict]) -> str:
     return "\n\n".join(system_parts) + "\n\n" + rendered
 
 
-def visible_text(model_text: str) -> str:
+def _strip_call_lines(text: str) -> str:
+    """Drop every line that starts with the 🔧 call marker (CMP-3,
+    2026-11-12). The only source of 🔧 in model output is the » call
+    marker (visible_text converts » to 🔧), and » is emitted only as
+    a tool-call line — so a 🔧-initial line IS a call line by
+    construction, well-formed or not. This catches the malformed
+    variants a strict call-shape regex would miss (unclosed quotes,
+    missing quotes, trailing junk). Lines are dropped whole; all
+    other text is untouched."""
+    return "\n".join(ln for ln in text.split("\n")
+                     if not ln.lstrip().startswith("🔧"))
+
+
+def visible_text(model_text: str, *, strip_calls: bool = True) -> str:
+    """Visible reply text: tool result blocks removed, the » call
+    marker rendered as 🔧, and (CMP-3) text-form tool-call lines
+    stripped. v17 frequently emits hallucinated calls as reply TEXT
+    (🔧 read_file("...") / 🔧 search("...") with fabricated args)
+    that are never real calls — the structured tool_calls field is []
+    in every case — and they used to show up in the visible reply as
+    garbage (and as fake tool chips in the site UI). Real executed
+    calls are unaffected: they ride the structured tool_calls field
+    and the {"tool": ...} frames, which this never touches. With
+    strip_calls=False the old behavior is kept (used only for the
+    CMP-3 empty-reply fallback in chat())."""
     out = _BLOCK_RE.sub("", model_text)
-    return out.replace("»", "🔧").strip()
+    out = out.replace("»", "🔧")
+    if strip_calls:
+        out = _strip_call_lines(out)
+    return out.strip()
 
 
 def chat(messages: list[dict], max_new: int, temperature: float,
@@ -1484,6 +1511,13 @@ def chat(messages: list[dict], max_new: int, temperature: float,
     # fetch results. Fail-open — any guard error leaves the reply
     # exactly as the model wrote it.
     reply_text = visible_text(reply)
+    if not reply_text:
+        # CMP-3 fallback: the reply was ONLY call lines — show the
+        # original text rather than an empty reply. The filter must
+        # never empty a reply. (The streaming path needs no fallback:
+        # an empty emit just sends nothing, and the next round's text
+        # streams normally.)
+        reply_text = visible_text(reply, strip_calls=False)
     try:
         last_user = (messages[-1].get("content", "")
                      if messages and messages[-1].get("role") == "user"
