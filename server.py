@@ -18,7 +18,11 @@ on CPU. Endpoints:
                   deterministically: garbled/empty fetches short-circuit
                   to an honest reply, ungrounded page claims are
                   corrected from the page text, invented page results
-                  with no fetch are refused.
+                  with no fetch are refused. MIND-1 (2026-11-12): a
+                  `namespace` body field (or X-Nae1-Namespace header)
+                  enables CVM-Mind recall before generation and
+                  conservative remember after the turn — VM node only,
+                  fail-open everywhere else.
   POST /generate  Bearer CHAT_TOKEN; {prompt, ...} raw completion
   GET  /diag      Bearer DIAG_KEY; runtime diagnostics
   GET  /v1/models
@@ -111,6 +115,43 @@ def _resolve_node_name():
     return None
 
 NODE_NAME = _resolve_node_name()
+# MIND-1 (2026-11-12): CVM-Mind memory for chat. The MCI server is
+# VM-LOCAL ONLY (http://127.0.0.1:8377) — only the VM node can call it
+# directly. Render, the Mac node, and the Workers cannot. The same
+# server.py runs on all three legs, so ALL MCI wiring is fail-open:
+# no token file, unreachable server, or any MCI error means the request
+# proceeds exactly as before, with no recall and no error. The token is
+# read once at import from CVM_MCI_TOKEN or ~/.cvm-mci.env and is NEVER
+# logged, printed, or included in any response. Multi-node memory (a
+# shared MCI endpoint vs Mac-local MCI) is a follow-up — see NEA1_OPS.md.
+MCI_URL = os.environ.get("MCI_URL", "http://127.0.0.1:8377").rstrip("/")
+MCI_RECALL_TIMEOUT = float(os.environ.get("MCI_RECALL_TIMEOUT", "2.0"))
+MCI_REMEMBER_TIMEOUT = float(os.environ.get("MCI_REMEMBER_TIMEOUT", "15.0"))
+# Namespaces: one per chat user, `user-<id>` only. The `user-` prefix
+# requirement keeps chat code out of the team namespaces (melo, manus,
+# shared) — the contract forbids chat from reading or writing them.
+_MCI_NS_RE = re.compile(r"^user-[A-Za-z0-9_-]{1,64}$")
+
+
+def _load_mci_token():
+    tok = os.environ.get("CVM_MCI_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        env_file = Path("~/.cvm-mci.env").expanduser()
+        if env_file.is_file():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("CVM_MCI_TOKEN="):
+                    tok = line.split("=", 1)[1].strip().strip("\"'")
+                    if tok:
+                        return tok
+    except OSError:
+        pass
+    return None
+
+
+MCI_TOKEN = _load_mci_token()
 # Clean, typable id for the OpenAI-compatible API (the label above carries
 # spaces and parens, which clients would have to URL-encode everywhere).
 API_MODEL_ID = "nea1-v13.2"
@@ -1027,6 +1068,171 @@ def _guard_reply(reply: str, fetched_texts: list[str],
     return reply
 
 
+# ---------------------------------------------------------------- mind (MCI)
+def _valid_namespace(ns) -> str | None:
+    """Return the namespace if it is a well-formed `user-<id>` value,
+    else None. Invalid namespaces are ignored silently (fail-open) —
+    the request proceeds with no recall and no error."""
+    if isinstance(ns, str) and _MCI_NS_RE.match(ns):
+        return ns
+    return None
+
+
+def _mci_call(path: str, payload: dict, timeout: float):
+    """One MCI HTTP call. Returns the parsed JSON dict, or None on ANY
+    failure (no token, unreachable server, timeout, bad status, bad
+    JSON). Fail-open by design — callers treat None as 'no memory'."""
+    if not MCI_TOKEN:
+        return None
+    try:
+        req = urllib.request.Request(
+            MCI_URL + path, data=json.dumps(payload).encode(),
+            method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", "Bearer " + MCI_TOKEN)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _mci_recall(namespace: str, query: str, top_k: int = 5) -> list[str]:
+    """Recalled memory texts for a query, newest-useful first. Empty
+    list on any failure. Each text is truncated to 200 chars so the
+    injected block stays inside the prompt budget. Measured warm
+    recall latency 2026-11-12: ~0.4s; the 2s timeout has headroom."""
+    out = _mci_call("/recall", {"namespace": namespace, "query": query,
+                                "top_k": top_k}, MCI_RECALL_TIMEOUT)
+    if not out or not isinstance(out.get("memories"), list):
+        return []
+    texts = []
+    for m in out["memories"]:
+        text = str((m or {}).get("text", "")).strip()
+        if text:
+            texts.append(text[:200])
+    return texts
+
+
+def _mci_remember(namespace: str, text: str, importance: float,
+                  tags: list[str]):
+    """Store one memory. Fire-and-forget: returns the memory id, or
+    None on any failure. Never raises."""
+    out = _mci_call("/remember", {
+        "namespace": namespace, "text": text, "tags": tags,
+        "importance": importance, "payload": {"source": "chat"}},
+        MCI_REMEMBER_TIMEOUT)
+    if out and isinstance(out.get("id"), str):
+        return out["id"]
+    return None
+
+
+# MIND-1 remember policy (conservative, deterministic, no model call):
+# remember ONLY explicit user-stated facts and preferences. The
+# patterns below match the fact-bearing clause; the stored text is the
+# user's own words, trimmed. Anything that does not match is not
+# remembered — most turns store nothing. Importance: identity 0.9,
+# preferences 0.8, projects/work 0.7.
+_MIND_PATTERNS = [
+    (re.compile(r"\bmy name is ([A-Za-z][A-Za-z' -]{1,40})", re.I),
+     0.9, ["identity"]),
+    (re.compile(r"\bcall me ([A-Za-z][A-Za-z' -]{1,40})", re.I),
+     0.9, ["identity"]),
+    (re.compile(r"\bi prefer ([^.!?\n]{3,120})", re.I), 0.8, ["pref"]),
+    (re.compile(r"\bmy favou?rite ([\w][\w ]{1,30}) is ([^.!?\n]{3,80})",
+                re.I), 0.8, ["pref"]),
+    (re.compile(r"\bi (?:really )?(?:like|love) ([^.!?\n]{3,120})", re.I),
+     0.8, ["pref"]),
+    (re.compile(r"\bi (?:don't|do not|dont) like ([^.!?\n]{3,120})", re.I),
+     0.8, ["pref"]),
+    (re.compile(r"\bi'?m working on ([^.!?\n]{3,120})", re.I),
+     0.7, ["project"]),
+    (re.compile(r"\bi live in ([^.!?\n]{3,80})", re.I), 0.8, ["fact"]),
+    (re.compile(r"\bi work (?:at|for|on) ([^.!?\n]{3,120})", re.I),
+     0.7, ["fact"]),
+]
+# NEVER store secrets: passwords, keys/tokens, card/bank numbers,
+# government IDs, email addresses. A candidate matching any of these
+# is dropped before it reaches MCI. The word matches are deliberately
+# broad (a fact containing "password" is secret-adjacent by definition);
+# the long-run pattern requires a mix of letters and digits so plain
+# long words are not filtered.
+_SECRET_RES = [
+    re.compile(r"passw(or)?d", re.I),
+    re.compile(r"api[_-]?key", re.I),
+    re.compile(r"\btoken\b", re.I),
+    re.compile(r"\bsecret\s*(?:[:=]|is\b)", re.I),
+    re.compile(r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b"),
+    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+    re.compile(r"\b(?=[A-Za-z0-9_\-]*[0-9])(?=[A-Za-z0-9_\-]*[A-Za-z])"
+               r"[A-Za-z0-9_\-]{24,}\b"),
+]
+
+
+def _looks_secret(text: str) -> bool:
+    return any(rx.search(text) for rx in _SECRET_RES)
+
+
+def _extract_memories(user_text: str) -> list[tuple[str, float, list[str]]]:
+    """Deterministic fact extraction for the remember policy. Returns
+    up to 3 (text, importance, tags) candidates, deduplicated. Pure
+    function — unit-tested in test_mind.py."""
+    if not user_text or len(user_text) > 2000:
+        return []
+    found = []
+    seen = set()
+    for rx, importance, tags in _MIND_PATTERNS:
+        for m in rx.finditer(user_text):
+            # Store the whole matched clause, tidied: strip, drop a
+            # trailing conjunction fragment, cap at 200 chars.
+            text = m.group(0).strip().rstrip(",;")
+            if len(text) > 200:
+                text = text[:197].rsplit(" ", 1)[0]
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if _looks_secret(text):
+                continue
+            found.append((text, importance, tags))
+            if len(found) >= 3:
+                return found
+    return found
+
+
+def _mind_remember_async(namespace: str, user_text: str) -> None:
+    """Fire-and-forget remember: extract facts from the user's message
+    and store them in a daemon thread. Never delays the reply, never
+    raises, never logs memory text (counts only)."""
+    if not namespace or not user_text:
+        return
+    candidates = _extract_memories(user_text)
+    if not candidates:
+        return
+
+    def _run():
+        try:
+            stored = 0
+            for text, importance, tags in candidates:
+                if _mci_remember(namespace, text, importance, tags):
+                    stored += 1
+            _log(f"[mind] remember {namespace} {stored}/"
+                 f"{len(candidates)} stored")
+        except Exception as exc:
+            _log(f"[mind] remember fail-open: {type(exc).__name__}: {exc}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _last_user_text(convo: list[dict]) -> str:
+    """The last user message's content, or '' — the only text the
+    remember policy ever mines."""
+    for m in reversed(convo):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return str(m.get("content", ""))
+    return ""
+
+
 # ---------------------------------------------------------------- generation
 class ClientGone(Exception):
     """The streaming client disconnected; abort generation and free the lock."""
@@ -1124,7 +1330,12 @@ def visible_text(model_text: str) -> str:
 
 def chat(messages: list[dict], max_new: int, temperature: float,
          top_p: float, rep_penalty: float = 1.0, emit=None,
-         min_p: float = 0.0, on_tool=None) -> dict:
+         min_p: float = 0.0, on_tool=None, namespace=None) -> dict:
+    # namespace (MIND-1): a validated `user-<id>` value, or None. When
+    # present, the VM node recalls the user's memories for the last user
+    # message and injects them into the prompt (below). On legs without
+    # MCI (Render, Mac) the recall is a silent no-op — same code, same
+    # behavior as before.
     # on_tool, when given, is called with one display event per tool
     # fire ({"tool", "arg", "ok", "status", "detail"?}) as the tool
     # executes. The event is a display-only channel: it never enters
@@ -1171,7 +1382,26 @@ def chat(messages: list[dict], max_new: int, temperature: float,
                                     "deterministic": True}],
                     "transcript": prompt + date_reply,
                     "truncated": False}
+    # MIND-1 recall: after the deterministic hooks (calc/date answers
+    # need no memory), before generation. The recalled memories are
+    # prepended to the rendered prompt — ahead of the CMP-1 system
+    # preamble, as bare context, never as NeuralAI: speech. Fail-open:
+    # any recall failure yields no memories and the prompt is unchanged.
+    memory_block = ""
+    if namespace and messages and messages[-1].get("role") == "user":
+        try:
+            hits = _mci_recall(namespace,
+                               messages[-1].get("content", ""), top_k=5)
+        except Exception as exc:
+            _log(f"[mind] recall fail-open: {type(exc).__name__}: {exc}")
+            hits = []
+        if hits:
+            _log(f"[mind] recall {namespace} {len(hits)} hits")
+            memory_block = ("Things I remember about you:\n" +
+                            "\n".join("- " + h for h in hits))
     prompt = render_prompt(messages)
+    if memory_block:
+        prompt = memory_block + "\n\n" + prompt
     # SVC-P2-14: generate() silently drops the oldest turns when the
     # prompt exceeds the context window. Flag it so the caller can say
     # so instead of answering from a silently shortened history.
@@ -1445,9 +1675,17 @@ class Handler(BaseHTTPRequestHandler):
         top_p = min(max(top_p, 0.01), 1.0)
         rep = min(max(rep, 0.5), 2.0)
         min_p = min(max(min_p, 0.0), 0.5)
+        # MIND-1: the caller's namespace, from the request body
+        # (`namespace` field — flows verbatim through the Workers and
+        # the switchboard) or the X-Nae1-Namespace header (direct
+        # callers). Invalid or absent means no memory for this turn.
+        namespace = _valid_namespace(req.get("namespace"))
+        if namespace is None:
+            namespace = _valid_namespace(
+                self.headers.get("X-Nae1-Namespace", ""))
         if is_v1:
             return self._v1_chat_completions(req, max_new, temperature,
-                                             top_p, rep, min_p)
+                                             top_p, rep, min_p, namespace)
         if v1path == "/generate":
             with GEN_LOCK:
                 text = generate(str(req.get("prompt", "")), max_new,
@@ -1461,9 +1699,11 @@ class Handler(BaseHTTPRequestHandler):
         # field is a 400 (the old branch's only reachable behavior).
         if "prompt" not in req and "messages" not in req:
             return self._json(400, {"error": "messages required"})
-        return self._site_stream(req, max_new, temperature, top_p, rep, min_p)
+        return self._site_stream(req, max_new, temperature, top_p, rep,
+                                 min_p, namespace)
 
-    def _v1_chat_completions(self, req, max_new, temperature, top_p, rep, min_p):
+    def _v1_chat_completions(self, req, max_new, temperature, top_p, rep,
+                             min_p, namespace=None):
         """OpenAI-compatible chat completion.
 
         Request: {model?, messages: [{role, content}], temperature?,
@@ -1496,13 +1736,17 @@ class Handler(BaseHTTPRequestHandler):
                                   "invalid_request_error")
         if req.get("stream"):
             return self._v1_stream_live(convo, max_new, temperature,
-                                        top_p, rep, min_p)
+                                        top_p, rep, min_p, namespace)
         try:
             out = chat(convo, max_new, temperature, top_p,
-                       rep_penalty=rep, min_p=min_p)
+                       rep_penalty=rep, min_p=min_p, namespace=namespace)
         except Exception as exc:
             return self._v1_error(500, f"generation failed: {exc}",
                                   "internal_error")
+        # MIND-1: remember after the turn (fire-and-forget thread —
+        # never delays the reply). Only the last user message is
+        # mined; earlier turns were remembered in their own turns.
+        _mind_remember_async(namespace, _last_user_text(convo))
         reply = out["reply"]
         prompt_tokens = count_tokens(render_prompt(convo))
         completion_tokens = count_tokens(reply)
@@ -1522,7 +1766,8 @@ class Handler(BaseHTTPRequestHandler):
             "truncated": out.get("truncated", False),
         }, cors=True)
 
-    def _v1_stream_live(self, convo, max_new, temperature, top_p, rep, min_p):
+    def _v1_stream_live(self, convo, max_new, temperature, top_p, rep,
+                        min_p, namespace=None):
         """Incremental OpenAI-compatible SSE stream (SVC-P1-2).
 
         Headers go out first; chat(..., emit=...) drives the content
@@ -1594,7 +1839,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             frame(chunk({"role": "assistant", "content": ""}, None))
             out = chat(convo, max_new, temperature, top_p,
-                       rep_penalty=rep, emit=emit, min_p=min_p)
+                       rep_penalty=rep, emit=emit, min_p=min_p,
+                       namespace=namespace)
+            # MIND-1: remember after the turn (fire-and-forget).
+            _mind_remember_async(namespace, _last_user_text(convo))
             reply = out["reply"]
             if reply and not state["sent"].endswith(reply):
                 # No emit covered this reply (deterministic hook, a
@@ -1634,7 +1882,8 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def _site_stream(self, req, max_new, temperature, top_p, rep, min_p=0.0):
+    def _site_stream(self, req, max_new, temperature, top_p, rep,
+                     min_p=0.0, namespace=None):
         """Site protocol (the public chat page): body {prompt, temperature,
         top_k, top_p, max_new_tokens, repetition_penalty} — or, since the
         2026-10-21 site rebuild, {messages: [{role, content}, ...]} for a
@@ -1708,7 +1957,9 @@ class Handler(BaseHTTPRequestHandler):
                           "content": str(req.get("prompt", ""))}]
             out = chat(convo,
                        max_new, temperature, top_p, rep_penalty=rep, emit=emit,
-                       on_tool=on_tool, min_p=min_p)
+                       on_tool=on_tool, min_p=min_p, namespace=namespace)
+            # MIND-1: remember after the turn (fire-and-forget).
+            _mind_remember_async(namespace, _last_user_text(convo))
             # tool_calls (with outcomes) rides the final frame so the page
             # can render details blocks even if a mid-stream tool frame
             # was dropped; the page skips entries it already rendered.
@@ -1740,6 +1991,10 @@ def main():
     # able to shift every date answer by a day.
     _log(f"[tz] TZ={os.environ.get('TZ')} local-today="
          f"{datetime.date.today()} ({time.tzname})")
+    # MIND-1: one line at startup — enabled means the token file was
+    # found (VM node); disabled is normal on Render/Mac (fail-open).
+    _log("[mind] " + ("enabled (token found)"
+                      if MCI_TOKEN else "disabled (no token)"))
     if os.environ.get("BLOCKING_LOAD"):
         # Modal: bind the port only once the model is ready, so the
         # platform's startup wait covers the full cold start and no
